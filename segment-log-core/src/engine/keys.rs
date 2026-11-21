@@ -307,7 +307,14 @@ fn compare(
 }
 
 impl Keys {
-    pub(super) fn new(hash: KeyHash, active: KeyMap, sealed: Vec<SealedKeys>) -> Self {
+    pub(super) fn new(hash: KeyHash, mut active: KeyMap, sealed: Vec<SealedKeys>) -> Self {
+        // As at a roll: sized for the newest sealed segment's keys, the first segment after open
+        // never rehashes them all on the writer at once. A log with no sealed segment has no hint.
+        let hint = sealed
+            .iter()
+            .max_by_key(|s| s.base)
+            .map_or(0, |s| s.filter.count());
+        active.reserve((hint as usize).saturating_sub(active.len()));
         Self {
             hash,
             active,
@@ -566,9 +573,8 @@ mod tests {
 
     // Issue 154: a map that grows from empty rehashes every key at once on the writer each time it
     // doubles, a stall of milliseconds at 8, 16 and 32 MiB into a segment.
-    #[test]
-    fn a_roll_sizes_the_next_map_for_as_many_keys_as_the_rolled_one() {
-        let active: KeyMap = (0..10_000u32)
+    fn keyed(n: u32) -> KeyMap {
+        (0..n)
             .map(|i| {
                 (
                     i.to_le_bytes().to_vec(),
@@ -578,9 +584,36 @@ mod tests {
                     },
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_roll_sizes_the_next_map_for_as_many_keys_as_the_rolled_one() {
+        let active = keyed(10_000);
         let mut keys = Keys::new(KeyHash::new(codec::LogId::new([7; 16])), active, Vec::new());
         keys.roll(0, 1, 1);
+        assert!(keys.active.capacity() >= 10_000);
+    }
+
+    // Issue 154: the first segment after open has no roll to size its map, so it grew on the
+    // writer like any unsized map. The newest sealed segment gives the same hint a roll would.
+    #[test]
+    fn open_sizes_the_active_map_for_as_many_keys_as_the_newest_sealed_segment() {
+        let log_id = codec::LogId::new([7; 16]);
+        let hash = KeyHash::new(log_id.clone());
+        let (base, next, filter_at) = (0, 10_000, codec::HEADER_LEN as u64);
+        let mut entries = hash.entries(&keyed(10_000));
+        let frames = codec::encode_key_frames(&log_id, base, 1, next, filter_at, &mut entries)
+            .expect("10,000 keys fit one key index");
+        let summary = SealedSummary {
+            base,
+            next,
+            filter_at,
+            footer_at: filter_at + (frames.filter.len() + frames.index.len()) as u64,
+        };
+        let sealed = SealedKeys::written(summary, &log_id, &frames.filter);
+        let keys = Keys::new(hash, keyed(10), vec![sealed]);
+        assert_eq!(keys.active.len(), 10);
         assert!(keys.active.capacity() >= 10_000);
     }
 }

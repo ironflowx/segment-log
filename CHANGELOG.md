@@ -2,6 +2,12 @@
 
 Each release lists its API breaks with a migration note, its format version bumps and the protocol versions it speaks ([ADR 0064](docs/decisions/0064-the-0-1-compatibility-promise.md)). The crates and the Go client (`clients/go/vX.Y.Z`) share one version.
 
+## Unreleased
+
+### Changed
+
+- **The first segment after open sizes its key map** for as many keys as the newest sealed segment, as a roll already does (#168), so it no longer rehashes every key on the writer as it grows ([issue 154](https://github.com/ironflowx/segment-log/issues/154)). A log with no sealed segment still starts from an empty map. No API or format change.
+
 ## 0.2.0 - 2026-11-20
 
 - **Speaks protocol versions:** 2.
