@@ -240,7 +240,12 @@ impl SegmentLog {
         let (gate, lifecycle) = match state {
             recovery::State::Sealed => (Gate::Closed, Lifecycle::Sealed),
             recovery::State::Writable(writable) => {
-                let mut keys = Keys::new(hash, writable.active_keys, writable.sealed_keys);
+                let mut keys = Keys::new(
+                    hash,
+                    writable.active_keys,
+                    writable.sealed_keys,
+                    options.roll_bytes,
+                );
                 // Open's own reads are done, so the build's reads come after them.
                 keys.start_building(&view, log_filter);
                 #[cfg(test)]
