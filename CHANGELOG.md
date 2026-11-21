@@ -6,7 +6,7 @@ Each release lists its API breaks with a migration note, its format version bump
 
 ### Changed
 
-- **The first segment after open sizes its key map** for as many keys as the newest sealed segment, as a roll already does (#168), so it no longer rehashes every key on the writer as it grows ([issue 154](https://github.com/ironflowx/segment-log/issues/154)). A log with no sealed segment still starts from an empty map. No API or format change.
+- **The first segment after open sizes its key map** for as many keys as the newest sealed segment, as a roll already does (#168), so it no longer rehashes every key on the writer as it grows ([issue 154](https://github.com/ironflowx/segment-log/issues/154), #194). The size is capped by the keys this open's `roll_bytes` can hold, so reopening with a smaller roll size does not reserve memory for the old segment's keys. A log with no sealed segment still starts from an empty map. No API or format change.
 
 ## 0.2.0 - 2026-11-20
 

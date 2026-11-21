@@ -29,6 +29,10 @@ pub(super) struct SealedKeys {
     filter: codec::KeyFilter,
 }
 
+/// The fewest bytes a keyed record entry takes in a group frame: its 16-byte header and one key
+/// byte (format.md, group record entry).
+const MIN_KEYED_ENTRY: u64 = 17;
+
 pub(super) type KeyMap = std::collections::HashMap<Vec<u8>, ActiveKey>;
 
 struct PendingKeys {
@@ -307,13 +311,21 @@ fn compare(
 }
 
 impl Keys {
-    pub(super) fn new(hash: KeyHash, mut active: KeyMap, sealed: Vec<SealedKeys>) -> Self {
+    pub(super) fn new(
+        hash: KeyHash,
+        mut active: KeyMap,
+        sealed: Vec<SealedKeys>,
+        roll_bytes: u64,
+    ) -> Self {
         // As at a roll: sized for the newest sealed segment's keys, the first segment after open
         // never rehashes them all on the writer at once. A log with no sealed segment has no hint.
+        // That segment may have rolled under a larger roll size than this open's, so the hint is
+        // capped by the keys this open's roll size can hold.
         let hint = sealed
             .iter()
             .max_by_key(|s| s.base)
-            .map_or(0, |s| s.filter.count());
+            .map_or(0, |s| u64::from(s.filter.count()))
+            .min(roll_bytes / MIN_KEYED_ENTRY);
         active.reserve((hint as usize).saturating_sub(active.len()));
         Self {
             hash,
@@ -590,30 +602,60 @@ mod tests {
     #[test]
     fn a_roll_sizes_the_next_map_for_as_many_keys_as_the_rolled_one() {
         let active = keyed(10_000);
-        let mut keys = Keys::new(KeyHash::new(codec::LogId::new([7; 16])), active, Vec::new());
+        let mut keys = Keys::new(
+            KeyHash::new(codec::LogId::new([7; 16])),
+            active,
+            Vec::new(),
+            Options::default().roll_bytes,
+        );
         keys.roll(0, 1, 1);
         assert!(keys.active.capacity() >= 10_000);
     }
 
-    // Issue 154: the first segment after open has no roll to size its map, so it grew on the
-    // writer like any unsized map. The newest sealed segment gives the same hint a roll would.
-    #[test]
-    fn open_sizes_the_active_map_for_as_many_keys_as_the_newest_sealed_segment() {
+    /// A sealed segment at `base` with `n` keys, as a roll leaves it.
+    fn sealed(hash: &KeyHash, base: u64, n: u32) -> SealedKeys {
         let log_id = codec::LogId::new([7; 16]);
-        let hash = KeyHash::new(log_id.clone());
-        let (base, next, filter_at) = (0, 10_000, codec::HEADER_LEN as u64);
-        let mut entries = hash.entries(&keyed(10_000));
+        let (next, filter_at) = (base + u64::from(n), codec::HEADER_LEN as u64);
+        let mut entries = hash.entries(&keyed(n));
         let frames = codec::encode_key_frames(&log_id, base, 1, next, filter_at, &mut entries)
-            .expect("10,000 keys fit one key index");
+            .expect("the keys fit one key index");
         let summary = SealedSummary {
             base,
             next,
             filter_at,
             footer_at: filter_at + (frames.filter.len() + frames.index.len()) as u64,
         };
-        let sealed = SealedKeys::written(summary, &log_id, &frames.filter);
-        let keys = Keys::new(hash, keyed(10), vec![sealed]);
+        SealedKeys::written(summary, &log_id, &frames.filter)
+    }
+
+    /// Given an older sealed segment with 10,000 keys, the newest with 2,000, and 10 recovered
+    /// active keys (issue 154)
+    /// When the log opens with the default roll size
+    /// Then the active map keeps its 10 keys and has room for the newest segment's 2,000, not the
+    /// older one's 10,000, so the first segment does not grow its map on the writer
+    ///
+    /// Cases: KEY-MEMORY
+    #[test]
+    fn open_sizes_the_active_map_for_the_newest_sealed_segments_keys() {
+        let hash = KeyHash::new(codec::LogId::new([7; 16]));
+        let sealed = vec![sealed(&hash, 0, 10_000), sealed(&hash, 10_000, 2_000)];
+        let keys = Keys::new(hash, keyed(10), sealed, Options::default().roll_bytes);
         assert_eq!(keys.active.len(), 10);
-        assert!(keys.active.capacity() >= 10_000);
+        assert!((2_000..10_000).contains(&keys.active.capacity()));
+    }
+
+    /// Given a newest sealed segment with 10,000 keys, rolled under a larger roll size
+    /// When the log opens with a roll size that holds at most 100 keyed record entries
+    /// Then the active map has room for 100 keys, not 10,000: open does not hold memory for keys
+    /// the active segment cannot reach
+    ///
+    /// Cases: KEY-MEMORY
+    #[test]
+    fn open_caps_the_active_map_hint_by_the_roll_size() {
+        let hash = KeyHash::new(codec::LogId::new([7; 16]));
+        let sealed = vec![sealed(&hash, 0, 10_000)];
+        let roll_bytes = 100 * MIN_KEYED_ENTRY;
+        let keys = Keys::new(hash, KeyMap::new(), sealed, roll_bytes);
+        assert!((100..1_000).contains(&keys.active.capacity()));
     }
 }
