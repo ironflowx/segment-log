@@ -225,7 +225,7 @@ impl Writer {
         #[cfg(test)]
         let written = crate::pipeline::clock();
         if let Some(keys) = self.keys.sealed(built.keys) {
-            // Freeing every key of a segment costs as much as hashing them.
+            // The map's few buffers are megabytes, whose pages take time to give back.
             if self.background_seal {
                 let _ = thread::Builder::new()
                     .name("segment-log-sealer".into())

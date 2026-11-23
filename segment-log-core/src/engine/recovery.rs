@@ -10,7 +10,7 @@ pub(super) struct Recovered {
 
 pub(super) enum State {
     Sealed,
-    Writable(Writable),
+    Writable(Box<Writable>),
 }
 
 pub(super) struct Writable {
@@ -237,14 +237,14 @@ pub(super) fn open(
         log_id: found.log_id,
         hash: found.hash,
         published: found.published,
-        state: State::Writable(Writable {
+        state: State::Writable(Box::new(Writable {
             lock,
             epoch,
             append_time: found.append_time,
             active,
             active_keys,
             sealed_keys,
-        }),
+        })),
     })
 }
 

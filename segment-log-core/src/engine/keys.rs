@@ -1,6 +1,8 @@
 use super::*;
 use survey::ReadOnly;
+mod key_map;
 mod log_filter;
+pub(super) use key_map::KeyMap;
 pub(crate) use log_filter::Mode as LogFilterMode;
 use log_filter::{Builder, LogFilter};
 
@@ -32,8 +34,6 @@ pub(super) struct SealedKeys {
 /// The fewest bytes a keyed record entry takes in a group frame: its 16-byte header and one key
 /// byte (format.md, group record entry).
 const MIN_KEYED_ENTRY: u64 = 17;
-
-pub(super) type KeyMap = std::collections::HashMap<Vec<u8>, ActiveKey>;
 
 struct PendingKeys {
     base: u64,
@@ -366,7 +366,7 @@ impl Keys {
         for (i, record) in submit.records.iter().enumerate() {
             if let Some(key) = &record.key {
                 self.active.insert(
-                    key.clone(),
+                    key,
                     ActiveKey {
                         position: position as u32,
                         record: (first + i) as u32,
@@ -390,7 +390,7 @@ impl Keys {
         debug_assert!(self.pending.is_none(), "one closing run pends at a time");
         // The next segment likely holds as many keys; sized now, it never rehashes them all on the
         // writer at once.
-        let next_map = KeyMap::with_capacity(self.active.len());
+        let next_map = KeyMap::sized_like(&self.active);
         let keys = Arc::new(std::mem::replace(&mut self.active, next_map));
         self.pending = Some(PendingKeys {
             base,
@@ -477,7 +477,7 @@ impl Keys {
         let Some(key) = &incoming.key else {
             return Ok(None);
         };
-        if let Some(&ActiveKey { position, record }) = self.active.get(key) {
+        if let Some(ActiveKey { position, record }) = self.active.get(key) {
             if u64::from(position) == staged.position {
                 let (request, index) = staged.origins[record as usize];
                 let entry = &staged.requests[request].submit.records[index];
@@ -496,7 +496,7 @@ impl Keys {
                 .ok_or(LookupFailure);
         }
         if let Some(pending) = &self.pending
-            && let Some(&ActiveKey { position, record }) = pending.keys.get(key)
+            && let Some(ActiveKey { position, record }) = pending.keys.get(key)
         {
             let at = Recorded {
                 base: pending.base,
@@ -586,17 +586,15 @@ mod tests {
     // Issue 154: a map that grows from empty rehashes every key at once on the writer each time it
     // doubles, a stall of milliseconds at 8, 16 and 32 MiB into a segment.
     fn keyed(n: u32) -> KeyMap {
-        (0..n)
-            .map(|i| {
-                (
-                    i.to_le_bytes().to_vec(),
-                    ActiveKey {
-                        position: 0,
-                        record: i,
-                    },
-                )
-            })
-            .collect()
+        let mut map = KeyMap::new();
+        for record in 0..n {
+            let at = ActiveKey {
+                position: 0,
+                record,
+            };
+            map.insert(&record.to_le_bytes(), at);
+        }
+        map
     }
 
     #[test]

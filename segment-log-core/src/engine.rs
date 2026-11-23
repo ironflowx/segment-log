@@ -240,6 +240,7 @@ impl SegmentLog {
         let (gate, lifecycle) = match state {
             recovery::State::Sealed => (Gate::Closed, Lifecycle::Sealed),
             recovery::State::Writable(writable) => {
+                let writable = *writable;
                 let mut keys = Keys::new(
                     hash,
                     writable.active_keys,
