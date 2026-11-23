@@ -2,13 +2,15 @@
 
 Each release lists its API breaks with a migration note, its format version bumps and the protocol versions it speaks ([ADR 0064](docs/decisions/0064-the-0-1-compatibility-promise.md)). The crates and the Go client (`clients/go/vX.Y.Z`) share one version.
 
-## Unreleased
+## 0.2.1 - 2026-11-23
+
+- **Speaks protocol versions:** 2.
 
 ### Changed
 
 - **A segment that outgrows its key index no longer moves every key at once** ([issue 200](https://github.com/ironflowx/segment-log/issues/200)). The active key map's index is 64 small maps instead of one, so an insert that grows one moves about 1/64 of the keys on the writer. An index can take up to about 2 MiB more in a full segment. On a slowed EPYC 7502P, the longest pause when a segment outgrows its index falls from 18 to 1.3 ms ([record](docs/evidence/issue200/README.md)). No API or format change.
 - **A segment's keys share one buffer in its key map** ([issue 154](https://github.com/ironflowx/segment-log/issues/154)). The active key map kept one heap buffer per key, about 226,000 in a full segment of keyed 256-byte records, and freeing them after a roll stalled the writer's own allocations in glibc malloc. Freeing the map is now a few frees. On an EPYC 7502P slowed until the old code misses the paced p99 bound (12.7 ms against 2.1 ms), p99 is now 1.5 ms. Not measured on the 7401P. No API or format change.
-- **The first segment after open sizes its key map** for as many keys as the newest sealed segment, as a roll already does (#168), so it no longer rehashes every key on the writer as it grows ([issue 154](https://github.com/ironflowx/segment-log/issues/154), #194). The size is capped by the keys this open's `roll_bytes` can hold, so reopening with a smaller roll size does not reserve memory for the old segment's keys. A log with no sealed segment still starts from an empty map. No API or format change.
+- **The first segment after open sizes its key map** for as many keys as the newest sealed segment, as a roll already does (#168), so it does not grow the map on the writer until it holds more keys than that ([issue 154](https://github.com/ironflowx/segment-log/issues/154), #194). The size is capped by the keys this open's `roll_bytes` can hold, so reopening with a smaller roll size does not reserve memory for the old segment's keys. A log with no sealed segment still starts from an empty map, and a segment that outgrows its map still grows it on the writer ([issue 200](https://github.com/ironflowx/segment-log/issues/200)). No API or format change.
 
 ## 0.2.0 - 2026-11-20
 
@@ -59,6 +61,6 @@ The first production release. From this release, every later build reads every f
 ### Known limits
 
 - In a Firecracker guest, append throughput reaches 52,860 records/s, but the paced p99 at 50,000 records/s is 69 ms, above the latency target ([ADR 0063](docs/decisions/0063-the-guest-benchmark-shares-pipelined-connections.md)).
-- On an AMD EPYC 7401P host, the in-process paced p99 at 50,000 records/s was 29 ms against a 1.94 ms bound, measured before the writer tail-latency fixes above. On an EPYC 7502P after #168, but before ADR 0067, it was 4.1 ms against a 1.8 ms bound. With ADR 0067, measured on 2026-11-23 on another EPYC 7401P, it is 13.5 ms against a 2.2 ms bound. The cause is fixed after 0.2.0 ([issue 154](https://github.com/ironflowx/segment-log/issues/154)).
+- On an AMD EPYC 7401P host, the in-process paced p99 at 50,000 records/s was 29 ms against a 1.94 ms bound, measured before the writer tail-latency fixes above. On an EPYC 7502P after #168, but before ADR 0067, it was 4.1 ms against a 1.8 ms bound. With ADR 0067, measured on 2026-11-23 on another EPYC 7401P, it is 13.5 ms against a 2.2 ms bound. The cause is fixed in 0.2.1 ([issue 154](https://github.com/ironflowx/segment-log/issues/154)).
 - A Go `Client` is one connection that goroutines cannot share; there is no pooled client yet ([issue 134](https://github.com/ironflowx/segment-log/issues/134)).
 - No replication, retention or compaction ([PRD non-goals](docs/prd.md#non-goals)).
