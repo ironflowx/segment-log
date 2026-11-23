@@ -26,7 +26,8 @@ for rev in $revs; do
   } > "$o/host-extra.txt" 2>&1
   M1_OUT=$o CARGO_TARGET_DIR=/root/issue154-build SEGMENT_LOG_EVIDENCE_DIR=/tmp/m1/data \
     bash scripts/m1-evidence-guest.sh > "$o/run.log" 2>&1
-  echo "$rev $(git rev-parse --short HEAD) capture exit $?" >> /root/issue154/summary.txt
+  rc=$?
+  echo "$rev $(git rev-parse --short HEAD) capture exit $rc" >> /root/issue154/summary.txt
   if [ "$(git rev-parse --short HEAD)" = "$main" ]; then
     binary=$(python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads,open(sys.argv[1])) if x.get("executable")))' "$o/build.jsonl")
     for run in 1 2 3; do

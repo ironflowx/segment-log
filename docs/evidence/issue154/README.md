@@ -70,3 +70,48 @@ write through, otherwise the same setup. No EPYC was offered. Both commits ran o
 The bound is about 1.9 ms. On this faster CPU main already passes, because the roll stalls hold
 fewer than 1% of the records, so p99 does not move. The stalls show in p999 and the maximum, which
 fall by about a third. On main the traced runs time the writer's closing run at 7.9 ms per roll.
+
+## EPYC 7401P rerun with ADR 0067
+
+Question: does paced p99 meet the bound on the issue's CPU with ADR 0067 (#170) and the open-time
+map sizing (#194, #195)? **No.** 0 of 5 runs on main.
+
+Hetzner auction #3119456, 2026-11-23: EPYC 7401P, 128 GB, 2x Samsung PM963 MZQLW960HMJP-00003
+CXV8601Q (not the PM983 of the requalified host), write cache write through, governor schedutil,
+Debian 12 (6.1.0-56), the second NVMe as ext4 on /tmp. Both commits ran on this box, 0d8ed88 first.
+
+| Commit | Closed-loop records/s | Paced p99 ms | Paced p999 ms | Paced max ms | Bound ms | Runs within the bound |
+|---|---|---|---|---|---|---|
+| 0d8ed88 (#168, before ADR 0067) | 152,801 | 22.2 (17.5–27.0) | 57.4 (48.6–58.1) | 69.9 (57.7–72.7) | 2.46 (2.04–12.0) | 0 of 5 |
+| 115a60b (main) | 157,701 | 13.5 (11.2–14.8) | 47.4 (42.9–48.6) | 56.1 (55.5–58.0) | 2.21 (1.92–2.31) | 0 of 5 |
+
+Medians of 5 runs, with the range. Runs 1 to 3 of 0d8ed88 are disturbed: 104 to 246 of their group
+flushes took more than 3 ms, against 0 to 2 in every other run. The cause is not known. Runs 4 and 5
+are not disturbed, and their p99 is 22.9 and 21.0 ms, so the fall on main does not rest on runs 1 to 3.
+
+### Where the stalls are
+
+Groups of at least twice the median submits, placed by frame bytes as above, per undisturbed run
+(of 1,000,000 records):
+
+| Place | 0d8ed88, runs 4–5 | 115a60b, runs 1–5 |
+|---|---|---|
+| After a roll (first 3.5 MiB of a later segment) | 34–37 groups, 15,341–16,519 records | 33–39 groups, 13,024–14,408 records |
+| First segment at 4, 8, 16 and 32 MiB | 6 groups, 1,864–1,939 records | 6–7 groups, 1,855–2,071 records |
+| Elsewhere | 6–7 groups, 802–937 records | 3–8 groups, 425–1,348 records |
+
+- **Rolls decide p99.** On main the groups after a roll hold 1.3–1.4% of the records, more than the
+  1% that p99 allows. The writer's own roll takes 0.61–0.90 ms, and main's traced runs time the
+  pending step at 0.1 ms, but they show gaps of 17–51 ms between group writes around a roll. What
+  holds the writer or the callers in that gap is not known.
+- **#194 and #195 do not reach this benchmark.** It opens an empty log (`records=0 segments=1`), so
+  no sealed segment gives a size, and the first segment's map still grows on the writer. The same
+  holds for the 3 groups in the 2026-11-19 rerun, which #194 named as its reason. The change only
+  helps a log that has a sealed segment at open, which no capture here measures.
+
+### Changes to the capture
+
+The first capture of main stopped before its latency runs. ADR 0071's close frame adds one
+`fdatasync` to a clean drop, and `m1-verify-syscalls.py` expected none. The main capture ran with the
+corrected verifier and its test trace laid over 115a60b; no measured code differs. `run.sh` also
+printed `capture exit 0` for that failure, because `$(git rev-parse)` replaced `$?`.

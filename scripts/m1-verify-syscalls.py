@@ -28,7 +28,7 @@ for line in Path(sys.argv[1]).read_text().splitlines():
             written.add(write[1])
 expected = {
     "provision": (0, None), "create": (1, 4), "commit-0": (1, 0), "commit-1": (1, 0),
-    "retry": (0, 0), "drop": (0, 0), "recovery": (0, 3),
+    "retry": (0, 0), "drop": (1, 0), "recovery": (0, 3),
     "recovered-drop": (0, 0), "done": (0, 0),
 }
 assert markers == list(expected), markers
@@ -42,6 +42,8 @@ expected_targets = {
                        ("fsync", log): 2, ("fsync", parent): 1}),
     "commit-0": Counter({("fdatasync", segment): 1}),
     "commit-1": Counter({("fdatasync", segment): 1}),
+    # A clean drop syncs its close frame (ADR 0071).
+    "drop": Counter({("fdatasync", segment): 1}),
     "recovery": Counter({("fsync", segment): 1, ("fsync", log): 1,
                          ("fsync", parent): 1}),
 }
