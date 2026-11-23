@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / 'scripts/m1-verify-syscalls.py'
-TRACE = ROOT / 'docs/evidence/m1/slice10/linux/syscalls.trace'
+TRACE = ROOT / 'scripts/fixtures/m1-syscalls.trace'
 
 
 class SyncTargets(unittest.TestCase):

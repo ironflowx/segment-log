@@ -57,6 +57,6 @@ The first production release. From this release, every later build reads every f
 ### Known limits
 
 - In a Firecracker guest, append throughput reaches 52,860 records/s, but the paced p99 at 50,000 records/s is 69 ms, above the latency target ([ADR 0063](docs/decisions/0063-the-guest-benchmark-shares-pipelined-connections.md)).
-- On an AMD EPYC 7401P host, the in-process paced p99 at 50,000 records/s was 29 ms against a 1.94 ms bound, measured before the writer tail-latency fixes above. On an EPYC 7502P after #168, but before ADR 0067, it was 4.1 ms against a 1.8 ms bound. An EPYC rerun with ADR 0067 is pending ([issue 154](https://github.com/ironflowx/segment-log/issues/154)).
+- On an AMD EPYC 7401P host, the in-process paced p99 at 50,000 records/s was 29 ms against a 1.94 ms bound, measured before the writer tail-latency fixes above. On an EPYC 7502P after #168, but before ADR 0067, it was 4.1 ms against a 1.8 ms bound. With ADR 0067, measured on 2026-11-23 on another EPYC 7401P, it is 13.5 ms against a 2.2 ms bound ([issue 154](https://github.com/ironflowx/segment-log/issues/154)).
 - A Go `Client` is one connection that goroutines cannot share; there is no pooled client yet ([issue 134](https://github.com/ironflowx/segment-log/issues/134)).
 - No replication, retention or compaction ([PRD non-goals](docs/prd.md#non-goals)).
