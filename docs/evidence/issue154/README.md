@@ -209,5 +209,5 @@ with the fix. The control window has 1.2–1.3 ms.
 
 - The base meets the bound here because the groups after rolls hold 0.73–0.78% of the records, under the 1% that p99
   allows. On the 7401P they hold 1.1–1.4%.
-- The fix also makes the first segment's map growth cheaper, as each entry is small and no key is
-  hashed or moved again.
+- The large groups at the first segment's map growth also fall. A likely reason, not tested apart:
+  growth now rehashes a small index of hashes, and no longer reads each key from its own buffer.
