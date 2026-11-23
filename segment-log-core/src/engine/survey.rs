@@ -623,7 +623,7 @@ pub(super) fn scan(
                             position: position as u32,
                             record: i as u32,
                         };
-                        keys.insert(key.to_vec(), at);
+                        keys.insert(key, at);
                     }
                     let tail = Tail {
                         revision: entry.revision,
