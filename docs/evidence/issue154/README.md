@@ -179,3 +179,35 @@ between group writes in the 60 ms after a closing run is durable is 20.3–44.9 
   cause of the largest maxima is not known.
 - Runs 1 to 3 of 0d8ed88 above may have been disturbed by `ext4lazyinit`, which was running on this
   box after the same setup. That was not checked on the first box.
+
+## The fix on an EPYC 7502P
+
+Question: does one shared key buffer per map (#198) remove the stalls on EPYC? **Yes: p999 28.2 → 1.56
+ms, and the stall after a roll is gone.** It does not show that the p99 bound is met on a 7401P: no
+7401P with two NVMe drives was offered, and on this box the base commit already meets it.
+
+[refs.sh](refs.sh) ran 115a60b (base) and 0f384cd (#198), interleaved, on Hetzner auction #3117926,
+2026-11-23: EPYC 7502P, 128 GB, Debian 12 (6.1.0-56, glibc 2.36), /tmp as ext4 on a Samsung PM983
+MZQLB960HAJR-00007 EDA5502Q (the other drive is a PM963). It waited for `ext4lazyinit` to finish.
+
+| | Base 115a60b | Fix 0f384cd |
+|---|---|---|
+| Paced p99 ms | 1.49 (1.47–1.54) | 1.36 (1.35–1.36) |
+| Paced p999 ms | 28.2 (26.9–28.7) | 1.56 (1.54–1.90) |
+| Paced max ms | 34.2 (32.7–36.5) | 4.45 (4.33–5.30) |
+| Bound ms | 1.83 (1.69–1.85) | 1.84 (1.78–1.86) |
+| Runs within the bound | 5 of 5 | 5 of 5 |
+| Records in large groups after rolls, per run | 7,267–7,754 | 0–371 |
+| Records in large groups at 4–32 MiB of the first segment, per run | 1,000–1,128 | 302–428 |
+| Closed-loop records/s | 212,418 (210,621–218,680) | 228,592 (225,755–228,968) |
+| Closed-loop p99 ms | 7.19 (6.54–7.98) | 5.67 (5.40–5.72) |
+| Peak resident MiB, closed loop | 519 (518–533) | 507 (497–509) |
+
+Medians of 5 runs, with the range. In the 3 traced runs of each (12 rolls), the longest gap between
+group writes in the 60 ms after a closing run is durable is 17.6–31.5 ms on the base and 1.2–2.8 ms
+with the fix. The control window has 1.2–1.3 ms.
+
+- The base meets the bound here because the groups after rolls hold 0.73–0.78% of the records, under the 1% that p99
+  allows. On the 7401P they hold 1.1–1.4%.
+- The fix also makes the first segment's map growth cheaper, as each entry is small and no key is
+  hashed or moved again.
