@@ -1,7 +1,7 @@
-use super::support::{bounded, fixtures::*, raw};
+use super::support::{bounded, bounded_by, fixtures::*, raw};
 use crate::repair::{Apply, Class, Outcome, PlanKind, apply_with, plan_with, verify_with};
 use crate::{storage, *};
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 fn apply(sim: &Sim, at: (u64, u64), drop_acknowledged: bool, backup: &str) -> Outcome {
     let apply = Apply {
@@ -559,7 +559,8 @@ fn class_f_is_not_reported_for_an_older_sealed_segment() {
 /// Cases: OPEN-DAMAGE-FOLLOWED
 #[test]
 fn a_proof_past_the_search_window_is_found() {
-    bounded(|| {
+    // The search tries every byte of 32 MiB: 3 s alone in a debug build, more on a busy runner.
+    bounded_by(Duration::from_secs(60), || {
         let first = raw::group(1, 0, &[b"a"]);
         let mut damaged = raw::group(1, 1, &[&vec![0xff; codec::FRAME_BODY_LIMIT - 64]]);
         damaged[40] ^= 0xff;

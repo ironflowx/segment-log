@@ -33,15 +33,18 @@ pub(crate) mod deadline;
 mod deadline_tests;
 
 pub(crate) fn bounded(f: impl FnOnce() + Send + 'static) {
-    let _deadline = deadline::Deadline::new(std::time::Duration::from_secs(10), || {});
+    bounded_by(std::time::Duration::from_secs(10), f);
+}
+
+/// `bounded` for a scenario whose own work can take that long on a busy runner.
+pub(crate) fn bounded_by(limit: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+    let _deadline = deadline::Deadline::new(limit, || {});
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let _ = tx.send(result);
     });
-    let result = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("scenario watchdog");
+    let result = rx.recv_timeout(limit).expect("scenario watchdog");
     worker.join().unwrap();
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
