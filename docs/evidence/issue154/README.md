@@ -211,3 +211,37 @@ with the fix. The control window has 1.2–1.3 ms.
   allows. On the 7401P they hold 1.1–1.4%.
 - The large groups at the first segment's map growth also fall. A likely reason, not tested apart:
   growth now rehashes a small index of hashes, and no longer reads each key from its own buffer.
+
+## The fix where the base misses the bound
+
+Question: does #198 meet the p99 bound on an EPYC where the code before it misses? **Yes: 5 of 5 runs
+at both speeds, against 0 of 5 before it.**
+
+No 7401P with two NVMe drives was offered, and a 7502P at full speed meets the bound without the fix.
+So [slow.sh](slow.sh) slowed a 7502P: 24 of 32 cores online (48 threads, as a 7401P has), boost off, and
+a top speed of 2.2 GHz, then 1.5 GHz. The rule set before the run: a speed counts only if the base
+misses the bound at it. Both count. [slow.py](slow.py) gives the rows.
+
+Hetzner auction #3117912, 2026-11-23: EPYC 7502P, 128 GB, Debian 12 (6.1.0-56, glibc 2.36), /tmp as
+ext4 on a Samsung PM983 MZQLB960HAJR-00007 EDA5502Q. 115a60b (base) and 5aa9ddb (main with #198),
+interleaved, after `ext4lazyinit` was done. A fixed loop took 0.344 s as the host comes, 0.488 s at
+2.2 GHz and 0.747 s at 1.5 GHz.
+
+| | Base, 2.2 GHz | Fix, 2.2 GHz | Base, 1.5 GHz | Fix, 1.5 GHz |
+|---|---|---|---|---|
+| Paced p99 ms | 3.06 (2.84–3.58) | 1.40 (1.38–1.42) | 12.7 (11.6–14.3) | 1.50 (1.49–1.53) |
+| Paced p999 ms | 31.7 (31.2–33.5) | 2.27 (2.13–2.41) | 40.9 (38.2–42.3) | 3.50 (3.40–3.64) |
+| Paced max ms | 39.6 (38.1–41.9) | 8.16 (7.39–12.6) | 47.6 (43.7–50.9) | 11.5 (11.3–12.1) |
+| Bound ms | 1.96 | 1.97 | 2.13 | 2.12 |
+| Runs within the bound | 0 of 5 | 5 of 5 | 0 of 5 | 5 of 5 |
+| Records in large groups after rolls, per run | 8,685–9,194 | 118–468 | 11,915–13,303 | 493–835 |
+| Same, at 4–32 MiB of the first segment | 1,454–1,670 | 599–666 | 2,215–2,464 | 989–1,117 |
+| Longest gap after a closing run, 8 rolls | 21.3–35.6 ms | 1.0–2.8 ms | 23.0–40.9 ms | 1.1–2.4 ms |
+
+Medians of 5 runs, with the range. At 1.5 GHz the base's p99, p999 and maximum are close to the 7401P's
+(9.90–13.5, 40.0–47.4 and 55.5–56.1 ms).
+
+- This is a 7502P slowed down, not a 7401P: one NUMA node against four, and a newer core. The 7401P
+  itself has not run with the fix.
+- The first segment's map growth still holds about 0.1% of the records at 1.5 GHz, so it stays out of
+  p99 and shows in the maximum.
