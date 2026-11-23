@@ -102,8 +102,8 @@ Groups of at least twice the median submits, placed by frame bytes as above, per
 
 - **Rolls decide p99.** On main the groups after a roll hold 1.3–1.4% of the records, more than the
   1% that p99 allows. The writer's own roll takes 0.61–0.90 ms, and main's traced runs time the
-  pending step at 0.1 ms, but they show gaps of 17–51 ms between group writes around a roll. What
-  holds the writer or the callers in that gap is not known.
+  pending step at 0.1 ms, but they show gaps of 17–51 ms between group writes around a roll. The
+  next section has the likely cause.
 - **#194 and #195 do not reach this benchmark.** It opens an empty log (`records=0 segments=1`), so
   no sealed segment gives a size, and the first segment's map still grows on the writer. The same
   holds for the 3 groups in the 2026-11-19 rerun, which #194 named as its reason. The change only
@@ -115,3 +115,37 @@ The first capture of main stopped before its latency runs. ADR 0071's close fram
 `fdatasync` to a clean drop, and `m1-verify-syscalls.py` expected none. The main capture ran with the
 corrected verifier and its test trace laid over 115a60b; no measured code differs. `run.sh` also
 printed `capture exit 0` for that failure, because `$(git rev-parse)` replaced `$?`.
+
+## What stalls the writer after a roll
+
+Question: what holds the writer in those gaps? **Likely the free of the rolled segment's key map,
+through glibc's allocator. Shown in a container for one part of the stall; not confirmed on EPYC.**
+
+When the closing run is durable, the writer hands the old map to a thread that frees it (#170,
+`write_pending`). That is about 226,000 key buffers that the writer allocated. glibc frees a buffer
+into the arena it came from, so the thread works in the writer's arena while the writer allocates.
+
+On the EPYC 7401P, in the 3 traced runs of 115a60b, all 12 rolls have a stall that starts 0.5–37 ms
+after the closing run is durable. In the 60 ms after it the longest gap between group writes is
+16.7–50.5 ms, against 1.2–8.6 ms in a control window 200–260 ms before it. One group's step from
+formed to encoded takes 1.4–21.2 ms, against 0.0–0.3 ms. That step does no I/O and no roll work.
+
+[arena.sh](arena.sh) ran three variants of 115a60b on 2026-11-23: rust:1.100.0-bookworm (glibc 2.36)
+under OrbStack on an Apple silicon Mac, 10 CPUs, /data on tmpfs. Same load, 12 rolls of 64 MiB each.
+
+| Variant | Longest formed-to-encoded step per roll | Same, control window | Writer time in allocator calls over 0.3 ms |
+|---|---|---|---|
+| As it is | 0.3–0.8 ms | 0.1 ms | 40.1 ms |
+| glibc without fastbins | 0.1–0.2 ms | 0.0–0.1 ms | 28.1 ms |
+| Old map never freed | 0.0–0.1 ms | 0.1–0.2 ms | 18.4 ms |
+
+- **Shown:** without the free, the encode step after a roll does not stall. Two earlier runs gave the
+  same order: 0.6–2.2, 0.3–1.8 and 0.0–0.1 ms at 64 MiB, and 0.5–0.8, 0.2–0.4 and 0.0–0.1 ms at
+  256 MiB (6 rolls each, 177, 117 and 35 ms in slow allocator calls).
+- **Expected and not seen:** four times the keys in a segment did not make one stall longer. So it is
+  not one merge whose cost follows the key count. Some slow calls use CPU and others wait.
+- **Not shown:** the longest gap, the records in large groups and paced p99 do not differ between the
+  variants here. This host does not have the EPYC's stalls, and its disk and scheduler noise is as
+  large as the effect. Only the map free removed on an EPYC host can show how much of p99 it causes.
+- The builder of the log filter also starts when the closing run is durable. It is not ruled out as
+  part of the gap.
