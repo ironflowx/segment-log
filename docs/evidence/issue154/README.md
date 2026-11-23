@@ -103,7 +103,7 @@ Groups of at least twice the median submits, placed by frame bytes as above, per
 - **Rolls decide p99.** On main the groups after a roll hold 1.3–1.4% of the records, more than the
   1% that p99 allows. The writer's own roll takes 0.61–0.90 ms, and main's traced runs time the
   pending step at 0.1 ms, but they show gaps of 17–51 ms between group writes around a roll. The
-  next section has the likely cause.
+  next sections have the cause.
 - **#194 and #195 do not reach this benchmark.** It opens an empty log (`records=0 segments=1`), so
   no sealed segment gives a size, and the first segment's map still grows on the writer. The same
   holds for the 3 groups in the 2026-11-19 rerun, which #194 named as its reason. The change only
@@ -118,8 +118,9 @@ printed `capture exit 0` for that failure, because `$(git rev-parse)` replaced `
 
 ## What stalls the writer after a roll
 
-Question: what holds the writer in those gaps? **Likely the free of the rolled segment's key map,
-through glibc's allocator. Shown in a container for one part of the stall; not confirmed on EPYC.**
+Question: what holds the writer in those gaps? **The free of the rolled segment's key map, through
+glibc's allocator.** The container runs here show it for one part of the stall; the EPYC runs in the
+next section confirm it.
 
 When the closing run is durable, the writer hands the old map to a thread that frees it (#170,
 `write_pending`). That is about 226,000 key buffers that the writer allocated. glibc frees a buffer
@@ -146,6 +147,35 @@ under OrbStack on an Apple silicon Mac, 10 CPUs, /data on tmpfs. Same load, 12 r
   not one merge whose cost follows the key count. Some slow calls use CPU and others wait.
 - **Not shown:** the longest gap, the records in large groups and paced p99 do not differ between the
   variants here. This host does not have the EPYC's stalls, and its disk and scheduler noise is as
-  large as the effect. Only the map free removed on an EPYC host can show how much of p99 it causes.
-- The builder of the log filter also starts when the closing run is durable. It is not ruled out as
-  part of the gap.
+  large as the effect.
+- The builder of the log filter also starts when the closing run is durable. The next section rules
+  it out.
+
+## The map free decides p99 on EPYC
+
+Question: how much of paced p99 does the map free cause, and does the log filter take part?
+**The map free causes the miss. Without it p99 is 1.63 ms and 5 of 5 runs are within the bound. The
+log filter takes no part.**
+
+[variants.sh](variants.sh) ran four builds of 115a60b, interleaved, on Hetzner auction #3119465,
+2026-11-23: EPYC 7401P, 128 GB, 2x Samsung PM963 MZQLW960HMJP-00003 CXV8601Q, Debian 12 (6.1.0-56,
+glibc 2.36), the second NVMe as ext4 on /tmp. It waited until mkfs's background inode-table writes
+(`ext4lazyinit`) were done. Nothing else was busy before any run.
+
+| Variant | Paced p99 ms | Paced p999 ms | Paced max ms | Bound ms | Runs within the bound | Records in large groups after rolls, per run |
+|---|---|---|---|---|---|---|
+| As it is | 9.90 (6.94–12.00) | 40.0 (39.8–44.0) | 55.5 (48.5–56.2) | 2.21 | 0 of 5 | 10,694–13,688 |
+| Old map never freed | 1.63 (1.62–1.64) | 16.3 (13.9–19.8) | 53.6 (33.9–73.1) | 2.20 | 5 of 5 | 716–919 |
+| Log filter off | 11.04 (9.21–11.72) | 44.1 (37.4–49.7) | 53.5 (44.2–65.8) | 2.20 | 0 of 5 | 11,687–13,273 |
+| Both | 1.61 (1.60–1.65) | 16.4 (15.2–18.6) | 44.1 (36.8–94.6) | 2.20 | 5 of 5 | 572–1,060 |
+
+Medians of 5 runs, with the range. In the 3 traced runs of each variant (12 rolls), the longest gap
+between group writes in the 60 ms after a closing run is durable is 20.3–44.9 ms as it is, and
+1.3–6.8 ms when the map is never freed. The control window has 1.3–1.5 ms in both.
+
+- Never freeing the map is a test, not a fix: it leaks the map of every rolled segment.
+- What stays in p999 and the maximum is not the map free. The first segment's map growth (1,816–2,666
+  records in large groups per run, 4–18 ms each in the traces above) is in all four variants. The
+  cause of the largest maxima is not known.
+- Runs 1 to 3 of 0d8ed88 above may have been disturbed by `ext4lazyinit`, which was running on this
+  box after the same setup. That was not checked on the first box.
