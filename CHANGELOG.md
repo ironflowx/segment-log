@@ -2,6 +2,12 @@
 
 Each release lists its API breaks with a migration note, its format version bumps and the protocol versions it speaks ([ADR 0064](docs/decisions/0064-the-0-1-compatibility-promise.md)). The crates and the Go client (`clients/go/vX.Y.Z`) share one version.
 
+## Unreleased
+
+### Changed
+
+- **A segment that outgrows its key index no longer moves every key at once** ([issue 200](https://github.com/ironflowx/segment-log/issues/200)). The active key map's index is 64 small maps instead of one, so an insert that grows one moves about 1/64 of the keys on the writer. An index can take up to about 2 MiB more in a full segment. On a slowed EPYC 7502P, the longest pause when a segment outgrows its index falls from 18 to 1.3 ms ([record](docs/evidence/issue200/README.md)). No API or format change.
+
 ## 0.2.1 - 2026-11-23
 
 - **Speaks protocol versions:** 2.

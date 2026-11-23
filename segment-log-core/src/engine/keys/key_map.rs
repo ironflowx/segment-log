@@ -1,18 +1,45 @@
 //! A segment's exact key map. Its keys lie one after another in one buffer, so that freeing a map
-//! is a few frees. One buffer for each key made that free stall the writer, whose allocations
+//! is a few frees, not one for each key. One buffer for each key made that free stall the writer, whose allocations
 //! share the buffers' allocator arena (issue 154).
 use super::ActiveKey;
-use std::{collections::HashMap, hash::BuildHasher};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState},
+};
+
+/// A map moves all its keys when it grows, and the writer waits. Each of many small maps moves
+/// only its own part, at another time than the others (issue 200).
+const INDEXES: usize = 64;
+
+type Index = HashMap<u64, u32, BuildHasherDefault<Hashed>>;
+
+/// Passes a slot through: it comes from a randomly keyed hash already.
+#[derive(Default)]
+struct Hashed(u64);
+
+impl Hasher for Hashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("an index hashes only u64 slots")
+    }
+
+    fn write_u64(&mut self, slot: u64) {
+        self.0 = slot;
+    }
+}
 
 // A segment's keys fit the `u32` ends.
 const _: () =
     assert!(crate::codec::KEYED_RECORD_LIMIT * crate::codec::KEY_LEN_MAX <= u32::MAX as usize);
 
-#[derive(Default)]
 pub(in crate::engine) struct KeyMap {
+    random: RandomState,
     /// The entry of each key, by the key's hash, or by the next free number after it when another
     /// key has that hash. No key is ever removed, so a lookup stops at the first free number.
-    slots: HashMap<u64, u32>,
+    slots: Vec<Index>,
     entries: Vec<Entry>,
     bytes: Vec<u8>,
 }
@@ -25,20 +52,28 @@ struct Entry {
 
 impl KeyMap {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(0, 0)
     }
 
     /// An empty map with room for as many keys and key bytes as `other` holds.
     pub fn sized_like(other: &Self) -> Self {
+        Self::with_capacity(other.len(), other.bytes.len())
+    }
+
+    fn with_capacity(keys: usize, bytes: usize) -> Self {
+        let index = || Index::with_capacity_and_hasher(keys.div_ceil(INDEXES), Default::default());
         Self {
-            slots: HashMap::with_capacity(other.len()),
-            entries: Vec::with_capacity(other.len()),
-            bytes: Vec::with_capacity(other.bytes.len()),
+            random: RandomState::new(),
+            slots: (0..INDEXES).map(|_| index()).collect(),
+            entries: Vec::with_capacity(keys),
+            bytes: Vec::with_capacity(bytes),
         }
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        self.slots.reserve(additional);
+        for index in &mut self.slots {
+            index.reserve(additional.div_ceil(INDEXES));
+        }
         self.entries.reserve(additional);
     }
 
@@ -48,7 +83,8 @@ impl KeyMap {
 
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
-        self.slots.capacity().min(self.entries.capacity())
+        let slots = self.slots.iter().map(Index::capacity).sum::<usize>();
+        slots.min(self.entries.capacity())
     }
 
     pub fn get(&self, key: &[u8]) -> Option<ActiveKey> {
@@ -67,7 +103,13 @@ impl KeyMap {
     }
 
     fn hash(&self, key: &[u8]) -> u64 {
-        self.slots.hasher().hash_one(key)
+        self.random.hash_one(key)
+    }
+
+    /// An index takes its buckets from a slot's low bits and its tags from the top ones, so other
+    /// bits choose the index.
+    fn index(slot: u64) -> usize {
+        (slot >> 32) as usize % INDEXES
     }
 
     fn key(&self, entry: usize) -> &[u8] {
@@ -80,7 +122,7 @@ impl KeyMap {
 
     /// The key's entry, or the free slot where it belongs.
     fn find(&self, mut slot: u64, key: &[u8]) -> Result<usize, u64> {
-        while let Some(&entry) = self.slots.get(&slot) {
+        while let Some(&entry) = self.slots[Self::index(slot)].get(&slot) {
             if self.key(entry as usize) == key {
                 return Ok(entry as usize);
             }
@@ -93,7 +135,7 @@ impl KeyMap {
         match self.find(hash, key) {
             Ok(entry) => self.entries[entry].at = at,
             Err(slot) => {
-                self.slots.insert(slot, self.entries.len() as u32);
+                self.slots[Self::index(slot)].insert(slot, self.entries.len() as u32);
                 self.bytes.extend_from_slice(key);
                 self.entries.push(Entry {
                     end: self.bytes.len() as u32,
@@ -107,6 +149,10 @@ impl KeyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn indexes(map: &KeyMap) -> impl Iterator<Item = &Index> {
+        map.slots.iter()
+    }
 
     fn at(record: u32) -> ActiveKey {
         ActiveKey {
@@ -129,8 +175,10 @@ mod tests {
             slots,
             entries,
             bytes,
+            ..
         } = KeyMap::new();
-        assert!(!frees_each(slots.into_iter()));
+        assert_eq!(slots.len(), INDEXES);
+        assert!(!frees_each(slots.into_iter().flatten()));
         assert!(!frees_each(entries.into_iter()));
         assert!(!frees_each(bytes.into_iter()));
     }
@@ -172,6 +220,43 @@ mod tests {
                 (vec![0; 256], 3)
             ]
         );
+    }
+
+    /// Given an empty map, and one sized for 226,165 keys as a roll leaves it (issue 200)
+    /// When 120,000 keys go into the first, and 235,000 into the second
+    /// Then no insert into a map of 10,000 keys or more moves over 1/32 of them in the index, so
+    /// growth stays off the writer's latency at any key count
+    ///
+    /// Cases: KEY-MEMORY
+    #[test]
+    fn an_insert_moves_a_small_part_of_the_index() {
+        let mut rolled = KeyMap::new();
+        for i in 0..226_165u32 {
+            rolled.insert(&i.to_le_bytes(), at(i));
+        }
+        for (mut map, keys) in [
+            (KeyMap::new(), 120_000u32),
+            (KeyMap::sized_like(&rolled), 235_000),
+        ] {
+            let mut moves = 0;
+            for i in 0..keys {
+                let before: Vec<_> = indexes(&map)
+                    .map(|index| (index.capacity(), index.len()))
+                    .collect();
+                map.insert(&i.to_le_bytes(), at(i));
+                let moved: usize = indexes(&map)
+                    .zip(before)
+                    .filter(|(index, (capacity, _))| index.capacity() != *capacity)
+                    .map(|(_, (_, len))| len)
+                    .sum();
+                moves += usize::from(moved > 0);
+                assert!(
+                    i < 10_000 || moved <= i as usize / 32,
+                    "{moved} of {i} keys moved"
+                );
+            }
+            assert!(moves > 0, "the map outgrew its room");
+        }
     }
 
     /// Given three keys with one hash, at the end of the hash range, and a key whose own hash is
