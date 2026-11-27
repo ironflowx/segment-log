@@ -124,6 +124,32 @@ pub(super) fn open(
         write_run(storage, &path, &rebuilt.run, rebuilt.start)?;
         let filter = &rebuilt.run[0];
         sealed_keys.push(SealedKeys::written(rebuilt.summary, &found.log_id, filter));
+    } else if let (Ending::Groups | Ending::Stopped, Some(summary)) =
+        (&found.newest.ending, found.sealed.last())
+    {
+        // The sealer may have died between the second-newest segment's footer and locator writes
+        // and their flush, which leaves a whole run in the page cache only. Its key frames were
+        // flushed before the footer was written, so rewriting the footer and locator in place, as
+        // the tail is rewritten below (ADR 0015), makes the whole run durable before the log
+        // rolls past it.
+        let path = segment_path(dir, summary.base);
+        let Value::Length(length) = call(storage, &path, Purpose::Recovery, Op::Open)? else {
+            return Err(io::Error::other("storage did not return a length").into());
+        };
+        let tail = usize::try_from(length.saturating_sub(summary.footer_at)).map_err(|_| {
+            OpenError::Corrupt {
+                segment: summary.base,
+                position: summary.footer_at,
+            }
+        })?;
+        let bytes = read_exact(storage, &path, Purpose::Recovery, summary.footer_at, tail)?;
+        call(
+            storage,
+            &path,
+            Purpose::Recovery,
+            Op::Write(summary.footer_at, bytes),
+        )?;
+        call(storage, &path, Purpose::Recovery, Op::SyncAll)?;
     }
 
     let segment = segment_path(dir, newest);

@@ -4,6 +4,7 @@
 From ADR 0061 the old segment's closing run is written after the roll, at the first group commit
 after the sealer returns it, or at drop: two frame writes and an fdatasync, then two more and an
 fdatasync, before that group's frame. It lands in exactly one of the phases roll, commit-1, done.
+From ADR 0071 the drop then appends a close frame to the new segment and fdatasyncs it.
 
 Input is a strace log of acceptance::evidence::real_storage_roll_phases, taken with
 -f -yy -e trace=openat,write,fdatasync,fsync so that each fd shows its path.
@@ -149,7 +150,7 @@ def verify(text):
     new = str(PurePosixPath(log) / NEW_SEGMENT)
 
     expected_writes = {
-        "commit-0": [first], "roll": [new, new], "commit-1": [new], "done": [],
+        "commit-0": [first], "roll": [new, new], "commit-1": [new], "done": [new],
     }
     for phase, paths in expected_writes.items():
         skip = first if phase != "commit-0" else None
@@ -166,7 +167,7 @@ def verify(text):
         "commit-0": Counter({("fdatasync", first): 1}),
         "roll": Counter({("fdatasync", new): 2, ("fsync", log): 1}),
         "commit-1": Counter({("fdatasync", new): 1}),
-        "done": Counter(),
+        "done": Counter({("fdatasync", new): 1}),
     }
     expected_syncs[run_phase][("fdatasync", first)] += 2
     report = []

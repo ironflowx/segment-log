@@ -148,6 +148,25 @@ fn summary_reads(segment: &[u8]) -> Calls {
     ]
 }
 
+/// What open does to a sealed segment: reads its summary, and, for the second-newest, rewrites its
+/// footer and locator in place and flushes them, so that a run found only in the page cache becomes
+/// durable (ADR 0015).
+fn open_calls(sealed: &[(u64, Vec<u8>)], index: usize) -> Calls {
+    let bytes = &sealed[index].1;
+    let mut calls = summary_reads(bytes);
+    if index + 1 == sealed.len() {
+        let at = closing(bytes).footer_at;
+        let tail = bytes[at as usize..].to_vec();
+        calls.extend([
+            (Purpose::Recovery, Op::Open),
+            (Purpose::Recovery, Op::Read(at, tail.len())),
+            (Purpose::Recovery, Op::Write(at, tail)),
+            (Purpose::Recovery, Op::SyncAll),
+        ]);
+    }
+    calls
+}
+
 /// Given a log with several sealed segments, some with keyed records and one with none
 /// When the log reopens
 /// Then from each segment before the newest, open reads only the header, the locator, the footer
@@ -171,8 +190,8 @@ fn open_reads_only_the_summary_of_each_sealed_segment() {
 
         let (log, counted) = open_counted(&sim);
         let mut filter_bytes = 0;
-        for ((base, bytes), (_, calls)) in sealed.iter().zip(counted) {
-            assert_eq!(calls, summary_reads(bytes), "segment {base}");
+        for (index, ((base, _), (_, calls))) in sealed.iter().zip(counted).enumerate() {
+            assert_eq!(calls, open_calls(sealed, index), "segment {base}");
             filter_bytes += calls
                 .iter()
                 .filter_map(|(purpose, op)| match (purpose, op) {
@@ -299,8 +318,8 @@ fn a_reopen_after_many_rolls_keeps_every_answer_and_reads_old_segments_lazily() 
         assert!(sealed.len() >= 5, "{} sealed segments", sealed.len());
 
         let (log, counted) = open_counted(&sim);
-        for ((base, bytes), (_, calls)) in sealed.iter().zip(counted) {
-            assert_eq!(calls, summary_reads(bytes), "segment {base}");
+        for (index, ((base, _), (_, calls))) in sealed.iter().zip(counted).enumerate() {
+            assert_eq!(calls, open_calls(sealed, index), "segment {base}");
         }
         assert_eq!(retry(&log), before.1);
         let lookups = |sim: &Sim| {

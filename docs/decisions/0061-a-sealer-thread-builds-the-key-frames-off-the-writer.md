@@ -75,6 +75,7 @@ Option D beat A and B because only moving the work off the writer bounds it, and
 
 ## Consequences
 
+- [ADR 0073](0073-open-makes-the-second-newest-segments-closing-run-durable.md) amends rule 8: a run that the second-newest segment's locator and footer prove is rewritten and flushed at open, so it is durable before the log rolls past it.
 - [ADR 0072](0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md) amends rules 1, 4 and 7 for a stepped log: the sealer is a task that the caller schedules, and where the writer would wait for it, the writer's step runs its job.
 - [ADR 0067](0067-the-sealer-writes-and-flushes-the-closing-run.md) (proposed) amends rule 3: the sealer, not the writer, writes and flushes the closing run.
 - ADR 0048 is amended. Rule 6's "Nothing rebuilds key frames" gains the exception of decision 8. Its consequence "Appends wait for that roll" no longer holds: appends wait only for writing the closing run.

@@ -376,3 +376,44 @@ fn a_failed_roll_step_poisons_the_writer_and_a_reopen_recovers() {
         }
     });
 }
+
+/// Given a rolled segment whose footer and locator were written but not yet flushed when the
+/// process was killed, so that a reopen finds the whole closing run in the page cache
+/// When the log reopens, rolls past that segment, and the machine then loses power
+/// Then the log still opens with every record, because the reopen made that run durable
+///
+/// Cases: KEY-FRAMES-CRASH, ORACLE-5
+#[test]
+fn a_whole_closing_run_found_unflushed_is_made_durable_by_open() {
+    bounded(|| {
+        let sim = Sim::new(654);
+        let log = open_rolling(&sim, EVERY_GROUP);
+        send(&log, vec![on_s(b"a", None)]).wait().unwrap();
+        send(&log, vec![on_s(b"b", Some(0))]).wait().unwrap();
+        drop(log);
+        let (seed, trace) = sim.trace();
+        // The cut falls on the flush after the rolled segment's footer and locator.
+        let flushes: Vec<usize> = (0..trace.len())
+            .filter(|&i| {
+                matches!(&trace[i], Event::Call(call, _, Outcome::Ok(_))
+                    if call.purpose == Purpose::Roll
+                        && call.op == Op::SyncData
+                        && call.path == Path::new(&raw::segment(0)))
+            })
+            .collect();
+        let cut = flushes[1];
+        for lost in 0..16 {
+            let replay = Sim::replay(seed, &trace[..cut]);
+            replay.crash(Crash::Kill, 0);
+            let log = open_rolling(&replay, EVERY_GROUP);
+            assert_eq!(payloads(&log), [b"a"], "lost {lost}");
+            send(&log, vec![on_s(b"b", Some(0))]).wait().unwrap();
+            send(&log, vec![on_s(b"c", Some(1))]).wait().unwrap();
+            drop(log);
+            assert_eq!(bases(&replay), [0, 1, 2]);
+            replay.crash(Crash::PowerLoss, lost);
+            let log = open_rolling(&replay, EVERY_GROUP);
+            assert_eq!(payloads(&log), [b"a", b"b", b"c"], "lost {lost}");
+        }
+    });
+}

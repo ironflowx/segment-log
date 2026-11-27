@@ -8,6 +8,10 @@ Each release lists its API breaks with a migration note, its format version bump
 
 - **A segment that outgrows its key index no longer moves every key at once** ([issue 200](https://github.com/ironflowx/segment-log/issues/200)). The active key map's index is 64 small maps instead of one, so an insert that grows one moves about 1/64 of the keys on the writer. An index can take up to about 2 MiB more in a full segment. On a slowed EPYC 7502P, the longest pause when a segment outgrows its index falls from 18 to 1.3 ms ([record](docs/evidence/issue200/README.md)). No API or format change.
 
+### Fixed
+
+- **Open now makes a rolled segment's closing run durable when it finds it only in the page cache** ([ADR 0073](docs/decisions/0073-open-makes-the-second-newest-segments-closing-run-durable.md)). If the process died after the sealer wrote a closing run's footer and locator but before their flush, the next open read them from the page cache, trusted them and never flushed them. Once the log rolled past that segment, a power loss could drop them, and every later open failed with `Corrupt`. Open now rewrites the second-newest segment's footer and locator in place and calls `sync_all`, as it already rewrites the newest segment's tail ([ADR 0015](docs/decisions/0015-open-makes-the-recovered-tail-durable.md)). That costs one small write and one flush at each writable open of a log with more than one segment. No API or format change.
+
 ## 0.2.1 - 2026-11-23
 
 - **Speaks protocol versions:** 2.
