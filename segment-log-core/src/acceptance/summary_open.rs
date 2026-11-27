@@ -150,7 +150,7 @@ fn summary_reads(segment: &[u8]) -> Calls {
 
 /// What open does to a sealed segment: reads its summary, and, for the second-newest, rewrites its
 /// footer and locator in place and flushes them, so that a run found only in the page cache becomes
-/// durable (ADR 0015).
+/// durable (ADR 0073).
 fn open_calls(sealed: &[(u64, Vec<u8>)], index: usize) -> Calls {
     let bytes = &sealed[index].1;
     let mut calls = summary_reads(bytes);

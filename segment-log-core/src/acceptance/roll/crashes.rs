@@ -417,3 +417,157 @@ fn a_whole_closing_run_found_unflushed_is_made_durable_by_open() {
         }
     });
 }
+
+/// The trace of two groups that roll once, cut at the flush after segment 0's footer and locator,
+/// so that a kill there leaves the whole run in the page cache only.
+fn unflushed_run() -> (u64, Vec<Event>) {
+    let sim = Sim::new(654);
+    let log = open_rolling(&sim, EVERY_GROUP);
+    send(&log, vec![on_s(b"a", None)]).wait().unwrap();
+    send(&log, vec![on_s(b"b", Some(0))]).wait().unwrap();
+    drop(log);
+    let (seed, trace) = sim.trace();
+    let cut = (0..trace.len())
+        .filter(|&i| {
+            matches!(&trace[i], Event::Call(call, _, Outcome::Ok(_))
+                if call.purpose == Purpose::Roll
+                    && call.op == Op::SyncData
+                    && call.path == Path::new(&raw::segment(0)))
+        })
+        .nth(1)
+        .unwrap();
+    (seed, trace[..cut].to_vec())
+}
+
+/// Opens, rolls past segment 0, loses power and opens again: every record is still there.
+fn roll_past_and_lose_power(sim: &Sim, lost: u64, label: &str) {
+    let log = open_rolling(sim, EVERY_GROUP);
+    assert_eq!(payloads(&log), [b"a"], "{label}");
+    send(&log, vec![on_s(b"b", Some(0))]).wait().unwrap();
+    send(&log, vec![on_s(b"c", Some(1))]).wait().unwrap();
+    drop(log);
+    sim.crash(Crash::PowerLoss, lost);
+    let log = open_rolling(sim, EVERY_GROUP);
+    assert_eq!(payloads(&log), [b"a", b"b", b"c"], "{label}");
+}
+
+/// Given a whole closing run that open finds unflushed and starts to rewrite
+/// When the open crashes before or after each of the rewrite's calls, in every mode, or its write
+/// or flush fails
+/// Then a failed open does not retry the call, and the next open, a roll past the segment and a
+/// power loss still keep every record
+///
+/// Cases: KEY-FRAMES-CRASH, ORACLE-5
+#[test]
+fn a_crash_or_fault_inside_opens_rewrite_of_the_run_recovers() {
+    bounded(|| {
+        let (seed, start) = unflushed_run();
+        let base = Sim::replay(seed, &start);
+        base.crash(Crash::Kill, 0);
+        let before = base.trace().1;
+        drop(open_rolling(&base, EVERY_GROUP));
+        let after = base.trace().1;
+        // Open's own reads of the segment come first; the rewrite is its last four calls there.
+        let calls: Vec<usize> = (before.len()..after.len())
+            .filter(|&i| {
+                matches!(&after[i], Event::Call(call, _, _)
+                if call.purpose == Purpose::Recovery && call.path == Path::new(&raw::segment(0)))
+            })
+            .collect();
+        let rewrite = &calls[calls.len() - 4..];
+        let ops: Vec<_> = rewrite
+            .iter()
+            .map(|&i| match &after[i] {
+                Event::Call(call, _, _) => std::mem::discriminant(&call.op),
+                _ => unreachable!(),
+            })
+            .collect();
+        let expected = [Op::Open, Op::Read(0, 0), Op::Write(0, vec![]), Op::SyncAll];
+        assert_eq!(
+            ops,
+            expected
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>()
+        );
+        for &i in rewrite {
+            for cut in [i, i + 1] {
+                for mode in MODES {
+                    for lost in 0..8 {
+                        let replay = Sim::replay(seed, &after[..cut]);
+                        replay.crash(mode, lost);
+                        roll_past_and_lose_power(
+                            &replay,
+                            lost,
+                            &format!("cut {cut} {mode:?} {lost}"),
+                        );
+                    }
+                }
+            }
+        }
+        for &i in &rewrite[2..] {
+            let Event::Call(call, _, _) = &after[i] else {
+                unreachable!()
+            };
+            let faults = match call.op {
+                Op::Write(..) => vec![Fault::Partial(1), Fault::NoSpace],
+                _ => vec![Fault::error(std::io::ErrorKind::Other).unwrap()],
+            };
+            for fault in faults {
+                for lost in 0..8 {
+                    let label = format!("{:?} {fault:?} {lost}", call.op);
+                    let replay = Sim::replay(seed, &before);
+                    replay.inject(call.clone(), fault.clone());
+                    let opened = SegmentLog::with_storage(
+                        Path::new("/log"),
+                        options(),
+                        Arc::new(replay.clone()),
+                    );
+                    assert!(opened.is_err(), "{label}");
+                    let trace = replay.trace().1;
+                    let last = trace.iter().rev().find_map(|event| match event {
+                        Event::Call(last, _, _) => Some(last),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        last,
+                        Some(call),
+                        "{label}: no call after the failure (ADR 0004)"
+                    );
+                    replay.crash(Crash::PowerLossTorn, lost);
+                    roll_past_and_lose_power(&replay, lost, &label);
+                }
+            }
+        }
+    });
+}
+
+/// Given a closing run whose second flush failed, so that its footer and locator are readable but
+/// never durable, even when the device flushes the file later
+/// When the log reopens, rolls past that segment, and the machine then loses power
+/// Then the log still opens with every record, because open wrote the run back before its flush
+///
+/// Cases: KEY-FRAMES-CRASH, ORACLE-5
+#[test]
+fn a_closing_run_whose_flush_failed_is_made_durable_by_open() {
+    bounded(|| {
+        let flush = Call::new(raw::segment(0), Purpose::Roll, Op::SyncData);
+        for lost in 0..16 {
+            let sim = Sim::new(654);
+            let log = open_rolling(&sim, EVERY_GROUP);
+            send(&log, vec![on_s(b"a", None)]).wait().unwrap();
+            // The first flush is the key frames'; while it is held, the fault waits for the second.
+            let first = sim.hold(flush.clone());
+            let pending = send(&log, vec![on_s(b"b", Some(0))]);
+            first.wait();
+            sim.inject(
+                flush.clone(),
+                Fault::error(std::io::ErrorKind::Other).unwrap(),
+            );
+            first.release(None);
+            assert!(pending.wait().is_err(), "a failed flush poisons the writer");
+            drop(log);
+            roll_past_and_lose_power(&sim, lost, &format!("lost {lost}"));
+        }
+    });
+}

@@ -7,7 +7,7 @@ deciders: [Altug Sahin]
 supersedes: null
 superseded_by: null
 tags: [recovery, durability, release-0.3]
-touches: [segment-log-core/src/engine/recovery.rs, docs/architecture/overview.md, docs/architecture/testing.md]
+touches: [segment-log-core/src/engine/recovery.rs, segment-log-core/src/acceptance/roll/crashes.rs, segment-log-core/src/acceptance/summary_open.rs, docs/architecture/overview.md, docs/architecture/testing.md, docs/decisions/0015-open-makes-the-recovered-tail-durable.md, docs/decisions/0061-a-sealer-thread-builds-the-key-frames-off-the-writer.md, CHANGELOG.md]
 enforced_by: test
 ---
 
@@ -23,6 +23,8 @@ The seeded crash test that [ADR 0072](0072-a-simulator-drives-the-log-through-pu
 4. The writer rolls again, so the segment is no longer the second-newest. ADR 0061 rule 8 rebuilds a missing run only in the second-newest.
 5. A power loss drops the page that holds the locator. Every later open fails with `Corrupt` at that segment, and the log cannot open until the repair tool runs.
 
+A failed second flush leads to the same state. After a failed `sync_data` the bytes stay readable, but a later successful flush need not make them durable unless they are written again ([ADR 0015](0015-open-makes-the-recovered-tail-durable.md), Consequences). The writer is poisoned, the next open finds the run whole, and the log rolls on.
+
 These facts are fixed:
 
 - No group is lost: the segment's groups were flushed before the roll. But the log is out of service, which ADR 0015 exists to prevent: whatever open keeps must be durable.
@@ -37,17 +39,22 @@ These facts are fixed:
 When the newest segment is not sealed and the second-newest's run was proved, not rebuilt, open reads the bytes from the footer to the end of the file, writes them back in place, and calls `sync_all`, as ADR 0015 does for the tail.
 
 - **For:** the same identical rewrite that ADR 0015 already relies on, with the same sector-atomicity assumption. It reads only the footer and the locator, so `ORACLE-13` holds.
-- **Against:** one write of the footer and locator, about 170 bytes plus one entry per stream, and one more `sync_all` at each writable open of a log with more than one segment, even when the run was durable all along.
+- **Against:** one write of the footer and locator (their widths are in [format.md](../architecture/format.md)), and one more `sync_all` at each writable open of a log with more than one segment, even when the run was durable all along.
 
-### Option B - rebuild the run whenever the newest segment has no group yet
+### Option B - only `sync_all` the second-newest segment
+
+- **For:** no write.
+- **Against:** after a failed flush the page cache may hold the bytes as clean, so a flush writes nothing. Only a new write makes them durable, which is why ADR 0015 rewrites rather than syncs.
+
+### Option C - rebuild the run whenever the newest segment has no group yet
 
 - **Against:** the newest segment can already hold groups when the process dies, because the sealer runs beside them. The failing seed had groups there.
 
-### Option C - make step 5 trust a run only when its flush is proven
+### Option D - make step 5 trust a run only when its flush is proven
 
 - **Against:** one barrier cannot record its own completion (ADR 0003). Nothing on disk tells a flushed run from one that is only in the page cache.
 
-### Option D - leave it to the repair tool
+### Option E - leave it to the repair tool
 
 - **Against:** a crash and a later power loss, both within the storage contract, would take the log out of service. That contradicts R14 and ADR 0015.
 
@@ -70,10 +77,14 @@ We accept one more small write and flush at open, which is cheap beside open's e
 - Amends ADR 0061 rule 8 and overview.md's open step 5: a run proved by its locator and footer is made durable before the log rolls past it.
 - Each writable open of a log with more than one segment makes one more write and one more `sync_all`. `ORACLE-13` is unchanged, because the extra read covers only the footer and the locator.
 - The in-crate open read-count scenarios list the rewrite's calls for the second-newest segment.
+- A log that an older build reopened and then rolled past such a run still holds it unflushed: this open looks only at the second-newest segment. A power loss there still needs the repair tool.
 
 ## Enforcement
 
-- `KEY-FRAMES-CRASH` gains `a_whole_closing_run_found_unflushed_is_made_durable_by_open` in `segment-log-core/src/acceptance/roll/crashes.rs`: a kill after the footer and locator writes and before their flush, a reopen, more rolls, then a power loss. The log still opens with every record. It failed with `Corrupt { segment: 0 }` before this change.
+- `KEY-FRAMES-CRASH` gains three scenarios in `segment-log-core/src/acceptance/roll/crashes.rs`. Each failed before this change.
+  - `a_whole_closing_run_found_unflushed_is_made_durable_by_open`: a kill after the footer and locator writes and before their flush, a reopen, more rolls, then a power loss. The log still opens with every record.
+  - `a_closing_run_whose_flush_failed_is_made_durable_by_open`: the same after a failed second flush.
+  - `a_crash_or_fault_inside_opens_rewrite_of_the_run_recovers`: a crash before and after each of the rewrite's calls in every mode, and a failed write or flush, which open does not retry. The next open, more rolls and a power loss keep every record.
 - `STEPPED-CRASH` (pull request 208) reaches the same order from its seeds once it lands.
 
 ## Revisit if
