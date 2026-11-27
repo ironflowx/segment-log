@@ -100,6 +100,7 @@ We chose the close frame because it closes the clean-drop case at the cost of on
 
 ## Consequences
 
+- [ADR 0072](0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md) adds a stepped log, whose drop is a crash and writes no close frame. Its `close()` writes one, as a drop of `SegmentLog` does.
 - [PR #190](https://github.com/ironflowx/segment-log/pull/190) corrects Enforcement to name what the tests check: `DROP-CLOSE-FRAME` cuts the close frame's write and flush, while the roll crash scenarios cover the pending closing run, and `FORMAT-MIXED` keeps its format-version hook as a stand-in for a version 3 build. What enforcement checks is unchanged.
 - Accepted by the owner on 2026-11-20, for 0.2.0 ([issue #183](https://github.com/ironflowx/segment-log/issues/183)).
 - Amends ADR 0003: after a clean drop, a damaged last group is no longer kept as a torn tail; open fails with `Corrupt`.

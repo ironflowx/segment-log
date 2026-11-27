@@ -73,6 +73,7 @@ Option D beat A because only taking the I/O off the writer bounds the writer's t
 
 ## Consequences
 
+- [ADR 0072](0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md) amends this decision: in a stepped log, the sealer is a task that the caller schedules, not a thread. Where the writer would wait for it, the writer's step runs its job.
 - Accepted by the owner on 2026-11-19 for the 0.1 release ([issue 133](https://github.com/ironflowx/segment-log/issues/133)).
 - ADR 0061 is amended. Rule 3 ("the writer writes the closing run") is replaced by decision 1–4 here. Its sentence that the sealer does no I/O no longer holds. Its option C is the option chosen here.
 - ADR 0051 is amended. Its Context fact "Only the writer thread writes segment files" becomes "only the writer writes the active segment; the sealer writes a rolled segment's closing run". The builder still writes no file.

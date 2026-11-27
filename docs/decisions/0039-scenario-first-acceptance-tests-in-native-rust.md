@@ -46,6 +46,7 @@ We accept the discipline cost of in-crate tests in exchange for an unchanged pub
 
 ## Consequences
 
+- [ADR 0072](0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md) amends this decision: the storage seam, a clock and a stepped log become public behind the `simulation` feature, which option C rejected. The simulator stays private and test-only.
 - Accepted by the owner on 2026-11-17 for the 0.1 release ([issue 133](https://github.com/ironflowx/segment-log/issues/133)).
 - [ADR 0043](0043-zero-linger-and-empty-read-boundaries.md) settles the two boundary outcomes left open below. Their definitions are in api.md.
 - [ADR 0014](0014-crash-testing-strategy.md)'s rule to print each failing seed now also saves the trace needed to rebuild the crash state.
