@@ -130,7 +130,8 @@ impl SteppedLog {
     }
 
     /// Closes admission as a drop of `SegmentLog` does. Later writer steps drain the queue, write
-    /// a pending closing run and the close frame, and end with `Stopped(Closed)`.
+    /// a pending closing run and the close frame, and end with `Stopped(Closed)`. It does nothing
+    /// after `seal`.
     pub fn close(&mut self) {
         *self.admission.gate.write().unwrap() = Gate::Closed;
     }

@@ -773,7 +773,6 @@ impl Machine {
 
     /// Classifies one request into the draft.
     fn take(&mut self, draft: &mut Draft, request: Request) -> Taken {
-        let options = self.options.clone();
         match self.writer.keys.classify(
             &self.view,
             &request.submit,
@@ -787,7 +786,7 @@ impl Machine {
                     Ok(revisions) => {
                         let added = body_size(&request.submit).unwrap() - codec::GROUP_HEADER_LEN;
                         let fits = self.writer.fits(draft, &request.submit);
-                        if draft.size + added > options.group_byte_cap
+                        if draft.size + added > self.options.group_byte_cap
                             || (!fits && !draft.requests.is_empty())
                         {
                             self.deferred = Some(request);
@@ -804,7 +803,7 @@ impl Machine {
                             // The roll waits for the group's first new submit, so that a group
                             // that appends nothing writes and flushes nothing.
                             let rolls = draft.requests.is_empty()
-                                && self.writer.rolls_before(draft.base, fits, &options);
+                                && self.writer.rolls_before(draft.base, fits, &self.options);
                             if rolls {
                                 #[cfg(test)]
                                 let started = std::time::Instant::now();

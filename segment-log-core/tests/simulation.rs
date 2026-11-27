@@ -47,6 +47,7 @@ enum Crash {
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     FlushError,
+    ReadError,
     Short(usize),
     Full,
 }
@@ -152,7 +153,7 @@ impl Disk {
                         let changed = |i: usize| {
                             file.volatile[i] != file.durable.get(i).copied().unwrap_or(0)
                         };
-                        if (sector..end).any(changed) && next(&mut seed) & 3 == 0 {
+                        if (sector..end).any(changed) {
                             let start = sector + next(&mut seed) as usize % (end - sector);
                             for (i, byte) in bytes.iter_mut().enumerate().take(end).skip(start) {
                                 if changed(i) {
@@ -194,6 +195,9 @@ impl Disk {
     }
 
     fn apply(s: &mut State, call: &Call, fault: Option<Fault>) -> io::Result<Value> {
+        if matches!(fault, Some(Fault::ReadError)) {
+            return Err(io::ErrorKind::Other.into());
+        }
         let path = &call.path;
         let changing = !matches!(call.op, Op::Read(..) | Op::Open | Op::List | Op::Random(_));
         if s.metadata_failed && changing {
@@ -364,14 +368,18 @@ impl Storage for Disk {
             s.trace.push(format!("{label} -> crash point"));
             return Err(io::ErrorKind::Interrupted.into());
         }
-        let fault = (changing && s.fault_rate > 0 && next(&mut s.rng).is_multiple_of(s.fault_rate))
-            .then(|| match &call.op {
-                Op::Append(b) | Op::Write(_, b) => match next(&mut s.rng) % 2 {
-                    0 => Fault::Short(next(&mut s.rng) as usize % b.len().max(1)),
-                    _ => Fault::Full,
-                },
-                _ => Fault::FlushError,
-            });
+        let reading = matches!(call.op, Op::Read(..));
+        let fault = ((changing || reading)
+            && s.fault_rate > 0
+            && next(&mut s.rng).is_multiple_of(s.fault_rate))
+        .then(|| match &call.op {
+            Op::Read(..) => Fault::ReadError,
+            Op::Append(b) | Op::Write(_, b) => match next(&mut s.rng) % 2 {
+                0 => Fault::Short(next(&mut s.rng) as usize % b.len().max(1)),
+                _ => Fault::Full,
+            },
+            _ => Fault::FlushError,
+        });
         let result = Self::apply(&mut s, &call, fault);
         let shown = match &result {
             Ok(Value::Bytes(b)) => format!("{} bytes", b.len()),
@@ -631,15 +639,21 @@ impl Run {
         let disk = self.disk.clone();
         disk.state().inside = true;
         let step = log.step(task);
-        disk.state().inside = false;
+        let mut s = disk.state();
+        s.inside = false;
+        s.trace.push(format!("step {task:?} -> {step:?}"));
+        drop(s);
         self.high = self.high.max(log.watermark());
         step
     }
 
-    /// Opens the log on the current image, crashing and retrying if the open itself crashes, and
-    /// checks that recovery left sealed segments as they were (ORACLE-6).
+    /// Opens the log on the current image with faults and crash points on, crashing and retrying
+    /// when the open itself crashes or fails, and checks that recovery left sealed segments as
+    /// they were (ORACLE-6). It leaves faults off.
     fn open(&mut self) {
-        for _ in 0..100 {
+        for attempt in 0..100 {
+            // Later attempts run without faults, so that every run ends.
+            self.faults(attempt < 10);
             let before = self.disk.segments();
             let (disk, clock) = (self.disk.clone(), self.clock.clone());
             match self.inside(|| SteppedLog::open("/log", options(), Arc::new(disk), clock)) {
@@ -653,18 +667,27 @@ impl Run {
                     );
                     // The second-newest may only have its closing run cut or completed: its
                     // header and groups stay.
-                    if let (Some(pending), Some(now)) = (before.get(keep), after.get(keep))
+                    if let (true, Some(pending), Some(now)) =
+                        (before.len() >= 2, before.get(keep), after.get(keep))
                         && pending.0 == now.0
                     {
                         assert_eq!(now.1.get(..64), pending.1.get(..64), "ORACLE-6");
                     }
                     self.log = Some(log);
+                    self.faults(false);
                     return;
                 }
                 Err(OpenError::Io(_)) => {
-                    if self.disk.state().dead {
+                    let (dead, failed) = {
+                        let s = self.disk.state();
+                        (s.dead, s.metadata_failed)
+                    };
+                    // A crash during recovery, or a failed directory flush, which the volume
+                    // refuses writes after until it restarts (V3).
+                    if dead || failed {
+                        let mode = if dead { self.crash_mode() } else { Crash::Kill };
                         let seed = next(&mut self.rng);
-                        self.disk.crash(Crash::PowerLoss, seed);
+                        self.disk.crash(mode, seed);
                     }
                 }
                 Err(error) => panic!("open failed: {error:?}"),
@@ -710,7 +733,6 @@ impl Run {
             let seed = next(&mut self.rng);
             self.disk.crash(mode, seed);
         }
-        self.faults(false);
         self.open();
         let records = self.records();
         // ORACLE-2 and ORACLE-3: whole submits, in order, each at most once.
@@ -882,6 +904,7 @@ impl Run {
     fn run(&mut self, actions: usize) {
         self.open();
         self.faults(true);
+        self.disk.state().trace.push("start".into());
         for _ in 0..actions {
             if self.sealed {
                 return;
@@ -959,21 +982,7 @@ fn run_seed(seed: u64) -> Vec<String> {
         run.trace()
     }));
     match result {
-        Ok(trace) => {
-            if std::env::var_os("SEGMENT_LOG_STEPPED_STATS").is_some() {
-                let count = |what: &str| trace.iter().filter(|l| l.contains(what)).count();
-                eprintln!(
-                    "seed {seed}: crashes {} faults {} group flushes {} rolls {} closes {} seals {}",
-                    count("crash "),
-                    trace.iter().filter(|l| l.contains(" Some(")).count(),
-                    count("Group SyncData"),
-                    count("Roll Create"),
-                    count("Close SyncData"),
-                    count("Seal SyncData"),
-                );
-            }
-            trace
-        }
+        Ok(trace) => trace,
         Err(panic) => {
             let disk = trace.lock().unwrap_or_else(|e| e.into_inner()).take();
             let path = std::env::temp_dir().join(format!("segment-log-stepped-{seed}.trace"));
@@ -1013,8 +1022,29 @@ const REGRESSIONS: &[u64] = &[];
 /// Cases: STEPPED-CRASH, ORACLE-1, ORACLE-2, ORACLE-3, ORACLE-4, ORACLE-5, ORACLE-6, ORACLE-7, ORACLE-8, ORACLE-9, ORACLE-10
 #[test]
 fn seeded_runs_crash_and_recover_what_they_acknowledged() {
+    let mut seen = BTreeMap::<&str, usize>::new();
     for seed in (0..seeds()).chain(REGRESSIONS.iter().copied()) {
-        run_seed(seed);
+        let trace = run_seed(seed);
+        for what in [
+            "-> crash point",
+            "FlushError",
+            "Short(",
+            "Full)",
+            "ReadError",
+            "Roll Create",
+            "step Sealer -> Worked",
+            "step KeyFilter -> Worked",
+            "Recovery Write",
+            "Stopped(Sealed)",
+            "Stopped(Closed)",
+            "Stopped(Poisoned)",
+        ] {
+            *seen.entry(what).or_default() += trace.iter().filter(|l| l.contains(what)).count();
+        }
+    }
+    // Every fault class and every task is reached, so the oracle is not checking empty runs.
+    for (what, count) in &seen {
+        assert!(*count > 0, "no run reached {what}: {seen:?}");
     }
 }
 
