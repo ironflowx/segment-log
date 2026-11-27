@@ -37,4 +37,16 @@ Capture 1's m3 run (46047265506) and a run on `main` (46048389862) both failed t
 
 ## Verdict
 
-The real path keeps its calls. By the rule set before the run, capture 2 misses only paced p50, by 3 µs, and capture 1 misses three measures. The owner decides whether to accept that. A paired run on a dedicated host, as for [issue 200](../issue200/README.md), would separate the code from the runner.
+The real path keeps its calls. By the rule set before the run, both hosted captures miss: capture 2 misses only paced p50, by 3 µs, and capture 1 misses three measures. **A paired run on a dedicated host is pending** ([owner's decision on pull request 208](https://github.com/ironflowx/segment-log/pull/208)), as for [issue 200](../issue200/README.md). Its numbers will be judged against the same rule, and this record will replace the verdict.
+
+## Dedicated-host procedure
+
+[paired.sh](paired.sh) runs on the host. The controller steps around it:
+
+1. Check EPYC availability on Hetzner's public auction data, and order an EPYC box with two NVMe drives and a primary IPv4 address, as for issue 200.
+2. Bootstrap it from the rescue system: `M7_HOST=root@<ip> scripts/m7-session.sh bootstrap`. That gives Debian 12 on the first drive and `/tmp` as ext4 on the second.
+3. Start the run detached: `ssh root@<ip> 'cd /root/segment-log && nohup docs/evidence/issue206/paired.sh /root/segment-log /root/issue206 <base> <head> > /root/issue206.log 2>&1 &'`. The base is `main` after the recovery fix; the head is pull request 208's head.
+4. On the host, the script fetches both commits and slows the host as issue 154 did: the 24 lowest cores online, boost off, a top speed of 1.5 GHz (`CAP`). It waits for `ext4lazyinit`, then runs `scripts/m1-compare-refs.sh`, which builds both commits and runs five alternating closed-loop pairs, then five paced pairs at 50,000 records/s. That is the run the hosted captures made, on a quiet machine.
+5. Wait for `/root/issue206/done.txt`, then `rsync` `/root/issue206/` to a scratch directory outside the repository.
+6. Cancel the server at once with `cancellation_date=now`, whether the run passed or failed.
+7. Judge `compare/latency/summary.md` and `compare/paced/summary.md` against the rule above. Then add the host (CPU, drive model and firmware from `host.txt`, slowing from `slow.txt`), the commits and the table here.
