@@ -108,7 +108,7 @@ pub fn recover_active_segment(data: &[u8]) {
         call(&sim, path, Purpose::Open, op).unwrap();
     }
     let version = codec::FORMAT_VERSION;
-    let first = match recovery::open(&sim, dir, keys::KeyHash::new, version) {
+    let first = match recovery::open(&sim, dir, keys::KeyHash::new, version, true) {
         Ok(recovered) => summary(recovered),
         // A frame epoch at the top of the range leaves no epoch for the next writer.
         Err(OpenError::Corrupt { .. } | OpenError::Exhausted) => return,
@@ -120,7 +120,7 @@ pub fn recover_active_segment(data: &[u8]) {
         "open kept bytes that were not in the segment"
     );
     let second = summary(
-        recovery::open(&sim, dir, keys::KeyHash::new, version).expect("a second open fails"),
+        recovery::open(&sim, dir, keys::KeyHash::new, version, true).expect("a second open fails"),
     );
     assert_eq!(first, second, "a second open finds other records");
     assert_eq!(
@@ -232,16 +232,17 @@ fn open_log(sim: &Sim, roll_bytes: u64) -> Result<SegmentLog, OpenError> {
         roll_bytes,
         ..Options::default()
     };
-    let storage: Arc<dyn Storage> = Arc::new(sim.clone());
+    let storage = Arc::new(sim.clone());
     // The inline log filter build and inline seal keep every run of one input the same.
     SegmentLog::start(
         Path::new("/log"),
         options,
+        storage.clone(),
         storage,
         keys::KeyHash::new,
         Limits::default(),
         LogFilterMode::Inline,
-        false,
+        SealMode::Inline,
     )
 }
 

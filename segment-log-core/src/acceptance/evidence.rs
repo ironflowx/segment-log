@@ -14,7 +14,7 @@ use std::{
 
 mod cpu;
 mod measured;
-use measured::Measured;
+use measured::{Clocked, Measured};
 
 struct Workspace(PathBuf);
 impl Workspace {
@@ -350,11 +350,6 @@ fn measured_appends_survive_reopen() {
     let path = workspace.0.join("log");
     let storage = Arc::new(Measured::new(false));
     let now = Instant::now();
-    let backend: Arc<dyn Storage> = if measured {
-        storage.clone()
-    } else {
-        Arc::new(Real::default())
-    };
     // The closing runs and the log filter are built off the writer, as `SegmentLog::open` builds
     // them (ADR 0061).
     let hooks = crate::engine::Hooks {
@@ -362,7 +357,19 @@ fn measured_appends_survive_reopen() {
         log_filter: crate::engine::LogFilterMode::Background,
         ..Default::default()
     };
-    let log = Arc::new(SegmentLog::with_hooks(&path, options(), backend, hooks).unwrap());
+    let log = Arc::new(
+        if measured {
+            SegmentLog::with_hooks(&path, options(), storage.clone(), hooks)
+        } else {
+            SegmentLog::with_hooks(
+                &path,
+                options(),
+                Arc::new(Clocked::new(Real::default())),
+                hooks,
+            )
+        }
+        .unwrap(),
+    );
     let opened = now.elapsed();
     let initial = files(&path);
     println!(

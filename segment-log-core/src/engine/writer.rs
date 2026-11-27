@@ -10,7 +10,7 @@ pub(super) struct Writer {
     pub keys: Keys,
     pub active: Active,
     pub limits: Limits,
-    pub background_seal: bool,
+    pub sealer: SealMode,
     /// The rolled segment whose closing run is not durable yet (ADR 0061, ADR 0067).
     pub pending: Option<Pending>,
     #[cfg(test)]
@@ -72,9 +72,29 @@ pub(super) struct Pending {
     sealing: Sealing,
 }
 
+/// Where a roll's closing run is built and written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SealMode {
+    /// On a sealer thread (ADR 0061, ADR 0067).
+    Thread,
+    /// Built on the writer at roll and written at the next group boundary. Tests use it, so that
+    /// traces stay the same from run to run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Inline,
+    /// As a sealer step that the caller schedules (ADR 0072).
+    #[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))]
+    Task,
+}
+
+type SealJob = Box<dyn FnOnce() -> io::Result<Built> + Send>;
+
 enum Sealing {
     Built(Built),
     Running(thread::JoinHandle<io::Result<Built>>),
+    /// Waits for a sealer step.
+    Queued(SealJob),
+    /// A sealer step has run.
+    Done(io::Result<Built>),
 }
 
 struct Built {
@@ -173,23 +193,30 @@ impl Writer {
             epoch: self.epoch,
         };
         create_segment(view.storage.as_ref(), &view.dir, Purpose::Roll, &header)?;
-        let sealing = if self.background_seal {
-            // The next segment is durable first, so the old one is never sealed with no successor.
-            // From here only the sealer writes the old segment, and only the writer the new one.
-            let (storage, path) = (view.storage.clone(), segment_path(&view.dir, base));
-            Sealing::Running(
-                thread::Builder::new()
-                    .name("segment-log-sealer".into())
-                    .spawn(move || {
-                        let mut built = job();
-                        if let Some(run) = built.run.take() {
-                            write_run(storage.as_ref(), &path, run)?;
-                        }
-                        Ok(built)
-                    })?,
-            )
-        } else {
-            Sealing::Built(job())
+        let sealing = match self.sealer {
+            SealMode::Inline => Sealing::Built(job()),
+            mode => {
+                // The next segment is durable first, so the old one is never sealed with no
+                // successor. From here only the sealer writes the old segment, and only the
+                // writer the new one.
+                let (storage, path) = (view.storage.clone(), segment_path(&view.dir, base));
+                let write = move || {
+                    let mut built = job();
+                    if let Some(run) = built.run.take() {
+                        write_run(storage.as_ref(), &path, run)?;
+                    }
+                    Ok(built)
+                };
+                if mode == SealMode::Thread {
+                    Sealing::Running(
+                        thread::Builder::new()
+                            .name("segment-log-sealer".into())
+                            .spawn(write)?,
+                    )
+                } else {
+                    Sealing::Queued(Box::new(write))
+                }
+            }
         };
         self.pending = Some(Pending { base, sealing });
         let spans = view.published.lock().unwrap().roll(self.epoch, self.epoch);
@@ -214,7 +241,10 @@ impl Writer {
             Sealing::Running(sealer) if wait || sealer.is_finished() => sealer
                 .join()
                 .map_err(|_| io::Error::other("the sealer panicked"))??,
-            sealing @ Sealing::Running(_) => {
+            // Waiting for a sealer step is running it, because a waiting thread lets it finish.
+            Sealing::Queued(job) if wait => job()?,
+            Sealing::Done(result) => result?,
+            sealing @ (Sealing::Running(_) | Sealing::Queued(_)) => {
                 self.pending = Some(Pending { base, sealing });
                 return Ok(());
             }
@@ -226,7 +256,7 @@ impl Writer {
         let written = crate::pipeline::clock();
         if let Some(keys) = self.keys.sealed(built.keys) {
             // The map's few buffers are megabytes, whose pages take time to give back.
-            if self.background_seal {
+            if self.sealer == SealMode::Thread {
                 let _ = thread::Builder::new()
                     .name("segment-log-sealer".into())
                     .spawn(move || drop(keys));
@@ -235,6 +265,25 @@ impl Writer {
         #[cfg(test)]
         crate::pipeline::event("pending", [started, written, crate::pipeline::clock()]);
         Ok(())
+    }
+
+    /// A sealer step: builds and writes the queued closing run. Reports whether there was one.
+    #[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))]
+    pub(super) fn run_sealer(&mut self) -> bool {
+        let Some(pending) = &mut self.pending else {
+            return false;
+        };
+        if !matches!(pending.sealing, Sealing::Queued(_)) {
+            return false;
+        }
+        let Sealing::Queued(job) = std::mem::replace(
+            &mut pending.sealing,
+            Sealing::Done(Err(io::ErrorKind::Interrupted.into())),
+        ) else {
+            unreachable!()
+        };
+        pending.sealing = Sealing::Done(job());
+        true
     }
 
     /// Appends a close frame and syncs it, once every group before it is durable (ADR 0071).
@@ -433,8 +482,8 @@ fn dequeued(message: Option<Message>, seal: &mut Option<mpsc::Sender<()>>) -> Op
     }
 }
 
-/// Marks the writer poisoned when its thread panics (api.md, admission step 3).
-struct PoisonOnPanic<'a>(&'a std::sync::atomic::AtomicBool);
+/// Marks the writer poisoned when a step panics (api.md, admission step 3).
+pub(super) struct PoisonOnPanic<'a>(pub &'a std::sync::atomic::AtomicBool);
 
 impl Drop for PoisonOnPanic<'_> {
     fn drop(&mut self) {
@@ -444,180 +493,411 @@ impl Drop for PoisonOnPanic<'_> {
     }
 }
 
-pub(super) fn run(
-    view: Arc<View>,
-    poisoned: Arc<std::sync::atomic::AtomicBool>,
+/// How the writer is ended (ADR 0072).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// A clean drop, or `SteppedLog::close`, finished: the queue is drained and the close frame
+    /// written (ADR 0071).
+    Closed,
+    Sealed,
+    Poisoned,
+}
+
+pub(super) enum Progress {
+    Worked,
+    /// Nothing to do until a request arrives or admission closes, or until the monotonic clock
+    /// reaches the deadline, the end of the gathering group's linger.
+    Idle(#[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))] Option<Duration>),
+    Stopped(Stop),
+}
+
+/// Where the writer thread would block. A stepped writer returns there instead (ADR 0072).
+enum Wait {
+    No,
+    Forever,
+    Until {
+        deadline: Duration,
+        remaining: Duration,
+    },
+}
+
+enum Received {
+    Message(Message),
+    /// Nothing is queued now, or the wait timed out.
+    Nothing,
+    /// The queue is empty and admission is closed.
+    Closed,
+    /// A stepped writer would wait here.
+    Blocked(Option<Duration>),
+}
+
+/// The group the writer is gathering between steps.
+struct Gathering {
+    draft: Draft,
+    /// When the writer first saw this group's linger over.
+    gathered: Option<Duration>,
+    next: Option<Request>,
+}
+
+/// The writer loop as steps, so that a caller can run it without a thread (ADR 0072). Each step
+/// ends where the thread would block, or after one group, a roll, a seal, a close or poison.
+pub(super) struct Machine {
+    pub view: Arc<View>,
+    pub poisoned: Arc<std::sync::atomic::AtomicBool>,
+    pub writer: Writer,
     receiver: mpsc::Receiver<Message>,
-    mut writer: Writer,
     options: Arc<Options>,
-) {
-    // A local, so that unwinding drops it before `receiver`: admission sees the flag before it
-    // can see the disconnected queue.
+    clock: Arc<dyn Clock>,
+    /// Without a thread, a step never blocks, and a seal is a mark instead of a message, because
+    /// the queue's bound could leave no room for it.
+    stepped: bool,
+    pub seal_requested: bool,
+    seal_delivered: bool,
+    deferred: Option<Request>,
+    seal: Option<mpsc::Sender<()>>,
+    gathering: Option<Gathering>,
+    pub stopped: Option<Stop>,
+}
+
+pub(super) fn run(mut machine: Machine) {
+    // A local, so that unwinding drops it before the machine's receiver: admission sees the flag
+    // before it can see the disconnected queue.
+    let poisoned = machine.poisoned.clone();
     let _panic = PoisonOnPanic(&poisoned);
-    let mut deferred = None;
-    let mut seal: Option<mpsc::Sender<()>> = None;
-    loop {
-        writer.keys.refresh();
-        let first = match deferred.take() {
-            Some(request) => request,
+    while !matches!(machine.step(), Progress::Stopped(_)) {}
+}
+
+impl Machine {
+    pub(super) fn new(
+        view: Arc<View>,
+        poisoned: Arc<std::sync::atomic::AtomicBool>,
+        writer: Writer,
+        receiver: mpsc::Receiver<Message>,
+        options: Arc<Options>,
+        clock: Arc<dyn Clock>,
+        stepped: bool,
+    ) -> Self {
+        Self {
+            view,
+            poisoned,
+            writer,
+            receiver,
+            options,
+            clock,
+            stepped,
+            seal_requested: false,
+            seal_delivered: false,
+            deferred: None,
+            seal: None,
+            gathering: None,
+            stopped: None,
+        }
+    }
+
+    pub(super) fn step(&mut self) -> Progress {
+        if let Some(stop) = self.stopped {
+            return Progress::Stopped(stop);
+        }
+        let progress = self.advance();
+        if let Progress::Stopped(stop) = progress {
+            self.stopped = Some(stop);
+        }
+        progress
+    }
+
+    fn receive(&mut self, wait: Wait) -> Received {
+        use mpsc::{RecvTimeoutError, TryRecvError};
+        if !self.stepped {
+            return match wait {
+                Wait::No => match self.receiver.try_recv() {
+                    Ok(message) => Received::Message(message),
+                    Err(TryRecvError::Empty) => Received::Nothing,
+                    Err(TryRecvError::Disconnected) => Received::Closed,
+                },
+                Wait::Forever => self
+                    .receiver
+                    .recv()
+                    .map_or(Received::Closed, Received::Message),
+                Wait::Until { remaining, .. } => match self.receiver.recv_timeout(remaining) {
+                    Ok(message) => Received::Message(message),
+                    Err(RecvTimeoutError::Timeout) => Received::Nothing,
+                    Err(RecvTimeoutError::Disconnected) => Received::Closed,
+                },
+            };
+        }
+        match self.receiver.try_recv() {
+            Ok(message) => Received::Message(message),
+            Err(TryRecvError::Empty) => match wait {
+                Wait::No => Received::Nothing,
+                Wait::Forever => Received::Blocked(None),
+                Wait::Until { deadline, .. } => Received::Blocked(Some(deadline)),
+            },
+            // The mark stands behind every admitted request, as the seal message does.
+            Err(TryRecvError::Disconnected) if self.seal_requested && !self.seal_delivered => {
+                self.seal_delivered = true;
+                Received::Message(Message::Seal(mpsc::channel().0))
+            }
+            Err(TryRecvError::Disconnected) => Received::Closed,
+        }
+    }
+
+    fn advance(&mut self) -> Progress {
+        let mut gathering = match self.gathering.take() {
+            Some(gathering) => gathering,
             None => {
-                if let Some(reply) = seal.take() {
-                    if writer.seal(&view).is_ok() {
-                        let _ = reply.send(());
-                    } else {
-                        poisoned.store(true, std::sync::atomic::Ordering::Release);
+                self.writer.keys.refresh();
+                let first = match self.deferred.take() {
+                    Some(request) => request,
+                    None => {
+                        if let Some(reply) = self.seal.take() {
+                            if self.writer.seal(&self.view).is_ok() {
+                                let _ = reply.send(());
+                                return Progress::Stopped(Stop::Sealed);
+                            }
+                            self.poisoned
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            return Progress::Stopped(Stop::Poisoned);
+                        }
+                        let message = match self.receive(Wait::Forever) {
+                            Received::Message(message) => message,
+                            Received::Closed => return self.shut_down(),
+                            Received::Blocked(until) => return Progress::Idle(until),
+                            Received::Nothing => return Progress::Idle(None),
+                        };
+                        match dequeued(Some(message), &mut self.seal) {
+                            Some(request) => request,
+                            None => return Progress::Worked,
+                        }
                     }
-                    return;
+                };
+                #[cfg(test)]
+                crate::pipeline::request(&first.submit, crate::pipeline::DEQUEUE);
+                Gathering {
+                    draft: Draft::new(self.view.watermark()),
+                    gathered: None,
+                    next: Some(first),
                 }
-                let Ok(message) = receiver.recv() else {
-                    // A dropped log leaves no closing run pending (ADR 0061, rule 7). Only then
-                    // is every group synced, so only then may a close frame say so (ADR 0071).
-                    // Nothing is retried after a failure (ADR 0004).
-                    if writer.write_pending(&view, true).is_ok()
-                        && !poisoned.load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        let _ = writer.close(&view);
-                    }
-                    return;
-                };
-                let Some(request) = dequeued(Some(message), &mut seal) else {
-                    continue;
-                };
-                request
             }
         };
-        #[cfg(test)]
-        crate::pipeline::request(&first.submit, crate::pipeline::DEQUEUE);
-        let mut draft = Draft::new(view.watermark());
-        // When the writer first saw this group's linger over.
-        let mut gathered = None;
-        let mut next = Some(first);
-        while let Some(request) = next.take() {
-            #[cfg(test)]
-            crate::pipeline::request(&request.submit, crate::pipeline::CLASSIFY);
-            match writer
-                .keys
-                .classify(&view, &request.submit, &draft.staged(writer.active.length))
-            {
-                Classification::New => {
-                    match revisions(&request.submit, &draft.tails, &view.published) {
-                        Err(error) => {
-                            request.answer(Err(error));
-                        }
-                        Ok(revisions) => {
-                            let added =
-                                body_size(&request.submit).unwrap() - codec::GROUP_HEADER_LEN;
-                            let fits = writer.fits(&draft, &request.submit);
-                            if draft.size + added > options.group_byte_cap
-                                || (!fits && !draft.requests.is_empty())
-                            {
-                                deferred = Some(request);
-                                break;
-                            }
-                            if draft
-                                .base
-                                .checked_add(draft.assigned.len() as u64)
-                                .and_then(|next| {
-                                    next.checked_add(request.submit.records.len() as u64)
-                                })
-                                .is_none()
-                            {
-                                request.answer(Err(CommitError::Exhausted));
-                            } else {
-                                // The roll waits for the group's first new submit, so that a group
-                                // that appends nothing writes and flushes nothing.
-                                if draft.requests.is_empty()
-                                    && writer.rolls_before(draft.base, fits, &options)
-                                {
-                                    #[cfg(test)]
-                                    let started = Instant::now();
-                                    let rolled = writer.roll(&view, draft.base);
-                                    #[cfg(test)]
-                                    writer.rolls.lock().unwrap().push(started.elapsed());
-                                    if rolled.is_err() {
-                                        writer.keys.stop_building();
-                                        poison(&poisoned, draft, Some(request), receiver, false);
-                                        return;
-                                    }
-                                    debug_assert!(
-                                        writer.fits(&draft, &request.submit),
-                                        "a submit under the group cap fits an empty segment's closing frames"
-                                    );
-                                }
-                                writer.stage(&mut draft, request, &revisions);
-                            }
-                        }
+        loop {
+            if let Some(request) = gathering.next.take() {
+                #[cfg(test)]
+                crate::pipeline::request(&request.submit, crate::pipeline::CLASSIFY);
+                match self.take(&mut gathering.draft, request) {
+                    Taken::Staged => {}
+                    Taken::Deferred => break,
+                    Taken::Rolled => {
+                        // A roll ends a step, so that a sealer step can come before the group.
+                        self.gathering = Some(gathering);
+                        return Progress::Worked;
                     }
-                }
-                Classification::DurableRetry(records) => {
-                    request.answer(Ok(Committed {
-                        records,
-                        deduplicated: true,
-                    }));
-                }
-                Classification::PendingRetry(positions) => {
-                    draft.waiters.push(RetryWaiter { request, positions });
-                }
-                Classification::Rejected(error) => {
-                    request.answer(Err(error));
-                }
-                Classification::LookupFailure => {
-                    draft.requests.push(request);
-                    writer.keys.stop_building();
-                    poison(&poisoned, draft, deferred.take(), receiver, false);
-                    return;
+                    Taken::Stopped(progress) => return progress,
                 }
             }
-            next = match draft.requests.first() {
-                _ if seal.is_some() => None,
+            let first = gathering.draft.requests.first().map(|r| r.admitted);
+            gathering.next = match first {
+                _ if self.seal.is_some() => None,
                 // No new submit has joined yet, so no linger runs.
-                None => dequeued(receiver.try_recv().ok(), &mut seal),
-                Some(first) => {
+                None => match self.receive(Wait::No) {
+                    Received::Message(message) => dequeued(Some(message), &mut self.seal),
+                    _ => None,
+                },
+                Some(admitted) => {
                     // The linger runs from the admission of the group's first submit, so the time
                     // that submit spent queued behind the previous flush counts (ADR 0046).
-                    let remaining = options.linger.saturating_sub(first.admitted.elapsed());
+                    let now = self.clock.monotonic();
+                    let remaining = self
+                        .options
+                        .linger
+                        .saturating_sub(now.saturating_sub(admitted));
                     if remaining.is_zero() {
                         // The group takes the submits admitted before the writer first saw the
                         // linger over. Without that limit, steady arrivals keep one group
                         // gathering until the byte cap.
-                        let limit = *gathered.get_or_insert_with(Instant::now);
-                        match dequeued(receiver.try_recv().ok(), &mut seal) {
-                            Some(late) if late.admitted > limit => {
-                                deferred = Some(late);
-                                None
+                        let limit = *gathering.gathered.get_or_insert(now);
+                        match self.receive(Wait::No) {
+                            Received::Message(message) => {
+                                match dequeued(Some(message), &mut self.seal) {
+                                    Some(late) if late.admitted > limit => {
+                                        self.deferred = Some(late);
+                                        None
+                                    }
+                                    queued => queued,
+                                }
                             }
-                            queued => queued,
+                            _ => None,
                         }
                     } else {
-                        dequeued(receiver.recv_timeout(remaining).ok(), &mut seal)
+                        let deadline = admitted.saturating_add(self.options.linger);
+                        match self.receive(Wait::Until {
+                            deadline,
+                            remaining,
+                        }) {
+                            Received::Message(message) => dequeued(Some(message), &mut self.seal),
+                            Received::Blocked(until) => {
+                                self.gathering = Some(gathering);
+                                return Progress::Idle(until);
+                            }
+                            Received::Nothing | Received::Closed => None,
+                        }
                     }
                 }
             };
             #[cfg(test)]
-            if let Some(request) = &next {
+            if let Some(request) = &gathering.next {
                 crate::pipeline::request(&request.submit, crate::pipeline::DEQUEUE);
             }
+            if gathering.next.is_none() {
+                break;
+            }
         }
+        let mut draft = gathering.draft;
         if draft.requests.is_empty() {
-            continue;
+            return Progress::Worked;
         }
         // The group's frame waits for no sealer: an unfinished closing run waits for a later group.
-        if writer.write_pending(&view, false).is_err() {
-            writer.keys.stop_building();
-            poison(&poisoned, draft, deferred.take(), receiver, true);
-            return;
+        if self.writer.write_pending(&self.view, false).is_err() {
+            let deferred = self.deferred.take();
+            return self.poison(draft, deferred, true);
         }
-        if writer.commit(&view, &mut draft).is_err() {
-            writer.keys.stop_building();
-            poison(&poisoned, draft, deferred.take(), receiver, false);
-            return;
+        if self
+            .writer
+            .commit(&self.view, self.clock.as_ref(), &mut draft)
+            .is_err()
+        {
+            let deferred = self.deferred.take();
+            return self.poison(draft, deferred, false);
         }
+        Progress::Worked
     }
+
+    /// Classifies one request into the draft.
+    fn take(&mut self, draft: &mut Draft, request: Request) -> Taken {
+        let options = self.options.clone();
+        match self.writer.keys.classify(
+            &self.view,
+            &request.submit,
+            &draft.staged(self.writer.active.length),
+        ) {
+            Classification::New => {
+                match revisions(&request.submit, &draft.tails, &self.view.published) {
+                    Err(error) => {
+                        request.answer(Err(error));
+                    }
+                    Ok(revisions) => {
+                        let added = body_size(&request.submit).unwrap() - codec::GROUP_HEADER_LEN;
+                        let fits = self.writer.fits(draft, &request.submit);
+                        if draft.size + added > options.group_byte_cap
+                            || (!fits && !draft.requests.is_empty())
+                        {
+                            self.deferred = Some(request);
+                            return Taken::Deferred;
+                        }
+                        if draft
+                            .base
+                            .checked_add(draft.assigned.len() as u64)
+                            .and_then(|next| next.checked_add(request.submit.records.len() as u64))
+                            .is_none()
+                        {
+                            request.answer(Err(CommitError::Exhausted));
+                        } else {
+                            // The roll waits for the group's first new submit, so that a group
+                            // that appends nothing writes and flushes nothing.
+                            let rolls = draft.requests.is_empty()
+                                && self.writer.rolls_before(draft.base, fits, &options);
+                            if rolls {
+                                #[cfg(test)]
+                                let started = std::time::Instant::now();
+                                let rolled = self.writer.roll(&self.view, draft.base);
+                                #[cfg(test)]
+                                self.writer.rolls.lock().unwrap().push(started.elapsed());
+                                if rolled.is_err() {
+                                    let draft = std::mem::replace(draft, Draft::new(draft.base));
+                                    return Taken::Stopped(self.poison(
+                                        draft,
+                                        Some(request),
+                                        false,
+                                    ));
+                                }
+                                debug_assert!(
+                                    self.writer.fits(draft, &request.submit),
+                                    "a submit under the group cap fits an empty segment's closing frames"
+                                );
+                            }
+                            self.writer.stage(draft, request, &revisions);
+                            if rolls {
+                                return Taken::Rolled;
+                            }
+                        }
+                    }
+                }
+            }
+            Classification::DurableRetry(records) => {
+                request.answer(Ok(Committed {
+                    records,
+                    deduplicated: true,
+                }));
+            }
+            Classification::PendingRetry(positions) => {
+                draft.waiters.push(RetryWaiter { request, positions });
+            }
+            Classification::Rejected(error) => {
+                request.answer(Err(error));
+            }
+            Classification::LookupFailure => {
+                draft.requests.push(request);
+                let draft = std::mem::replace(draft, Draft::new(draft.base));
+                let deferred = self.deferred.take();
+                return Taken::Stopped(self.poison(draft, deferred, false));
+            }
+        }
+        Taken::Staged
+    }
+
+    /// A dropped log leaves no closing run pending (ADR 0061, rule 7). Only then is every group
+    /// synced, so only then may a close frame say so (ADR 0071). Nothing is retried after a
+    /// failure (ADR 0004).
+    fn shut_down(&mut self) -> Progress {
+        let closed = self.writer.write_pending(&self.view, true).is_ok()
+            && !self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+            && self.writer.close(&self.view).is_ok();
+        if closed {
+            return Progress::Stopped(Stop::Closed);
+        }
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        Progress::Stopped(Stop::Poisoned)
+    }
+
+    fn poison(&mut self, draft: Draft, current: Option<Request>, unwritten: bool) -> Progress {
+        self.writer.keys.stop_building();
+        poison(&self.poisoned, draft, current, unwritten);
+        let refuse = |message| {
+            if let Message::Append(request) = message {
+                request.answer(Err(CommitError::Poisoned));
+            }
+        };
+        // A thread answers until every sender is gone. Without one, admission already refuses,
+        // so only what is queued is left.
+        if self.stepped {
+            self.receiver.try_iter().for_each(refuse);
+        } else {
+            self.receiver.iter().for_each(refuse);
+        }
+        Progress::Stopped(Stop::Poisoned)
+    }
+}
+
+enum Taken {
+    Staged,
+    Deferred,
+    Rolled,
+    Stopped(Progress),
 }
 
 impl Writer {
     /// A failed write or flush leaves every request of the draft unanswered.
-    fn commit(&mut self, view: &View, draft: &mut Draft) -> io::Result<()> {
+    fn commit(&mut self, view: &View, clock: &dyn Clock, draft: &mut Draft) -> io::Result<()> {
         let base = draft.base;
         #[cfg(test)]
         let mut timeline = crate::pipeline::Group::new(base, draft.requests.len());
@@ -636,7 +916,7 @@ impl Writer {
         let group = codec::Group {
             epoch: self.epoch,
             base_offset: base,
-            append_time: view.storage.now_millis().max(self.append_time),
+            append_time: clock.wall_millis().max(self.append_time),
             entries,
         };
         let bytes = codec::encode_group(&view.log_id, &group).expect("validated group");
@@ -715,7 +995,6 @@ fn poison(
     poisoned: &std::sync::atomic::AtomicBool,
     draft: Draft,
     current: Option<Request>,
-    receiver: mpsc::Receiver<Message>,
     unwritten: bool,
 ) {
     poisoned.store(true, std::sync::atomic::Ordering::Release);
@@ -734,10 +1013,5 @@ fn poison(
     }
     if let Some(request) = current {
         request.answer(Err(CommitError::Poisoned));
-    }
-    for message in receiver {
-        if let Message::Append(request) = message {
-            request.answer(Err(CommitError::Poisoned));
-        }
     }
 }

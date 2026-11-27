@@ -55,6 +55,10 @@ Use each term with this meaning only. If you need another meaning, use another w
 | **Wire vector** | One line of a `conformance/wire-vN.txt` file: a whole message written byte for byte from protocol.md's tables, with a name. The server tests and the Go client both check it. |
 | **Qualification record** | A document in `docs/` that identifies one stack and gives the evidence and result for each volume requirement ([ADR 0032](decisions/0032-qualify-deployment-storage-before-m6.md), [ADR 0040](decisions/0040-volumes-meet-testable-minimum-requirements.md)). |
 | **Handoff record** | The document that names one stack's surviving volume, its writer and reader mount paths, its reader and its handoff procedure ([testing.md](architecture/testing.md#surviving-volume-handoff-before-m6)). For the M7 stack it is [docs/evidence/m7/handoff.md](evidence/m7/handoff.md). |
+| **Stepped log** | A `SteppedLog`: a segment log that starts no thread. Its writer, sealer and key filter builder run only as steps that the caller schedules ([ADR 0072](decisions/0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md)). |
+| **Step** | One unit of a task's work in a stepped log. A writer step ends where the writer thread would wait, or after one group, a roll, a seal, a close or poison. |
+| **Task** | The background work that a stepped log's caller schedules: the writer, the sealer or the key filter builder. |
+| **Crash point** | A storage call that a simulated storage fails, after which it fails every call until the caller builds the crash image and reopens the log. |
 
 ## Diagrams
 

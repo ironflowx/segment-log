@@ -11,6 +11,7 @@ The sketch below describes the cumulative target. Implement each behavior in its
 | M1 | `SegmentLog::open`, `append`, `watermark`, bounded `read`, `stream_head`, `Pending::wait`, and writer-draining `Drop`. Expected revisions, key matching, recovery, poisoning and admission limits follow the accepted rules below. |
 | M3 | Segment roll and the effect of `roll_bytes`, multi-segment recovery and cross-segment log-id comparison under [ADR 0042](../decisions/0042-log-id-comparison-fixtures-start-with-multiple-segments.md). M1 remains single-segment without roll. |
 | M4 | `seal`, `LogReader`, sealed-log read-only open, footers and locators, and retained-key lookup through each sealed segment's key filter and key index ([ADR 0048](../decisions/0048-sealed-segments-carry-a-key-filter-and-index.md)). |
+| 0.3 | The [`simulation`](#simulation) module behind the `simulation` feature: the storage trait, the clock and `SteppedLog` ([ADR 0072](../decisions/0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md)). |
 
 ## Target signatures and defaults
 
@@ -292,6 +293,142 @@ Unused record slots and unused byte-buffer capacity are charged. Result storage 
 
 The charge is fixed until the request is answered. It does not decrease when data is moved or freed during processing. It varies with capacity and platform type sizes. It does not include caches, shared group-encoding buffers, allocator overhead, opaque standard-library channel internals, or results retained after the answer. It is not a limit on total process memory.
 
+## Simulation
+
+From 0.3, behind the `simulation` Cargo feature, which is off by default and adds no dependency ([ADR 0072](../decisions/0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md)). The module lets a deterministic simulator supply the storage and the clock, and run the log's background work as steps. It adds items only: `SegmentLog` behaves the same with the feature on. ADR 0064 rule 15 covers it as it covers the rest of the API.
+
+```rust
+pub mod simulation {
+    /// Every file and directory operation the log performs. The log calls it from the thread that
+    /// runs its work: for a `SteppedLog`, the caller's thread, inside one of its methods.
+    pub trait Storage: Send + Sync {
+        fn call(&self, call: Call) -> std::io::Result<Value>;
+        /// Fails with `WouldBlock` while another guard holds the lock.
+        fn lock(&self, path: &Path) -> std::io::Result<Box<dyn Lock>>;
+    }
+    /// The directory lock. Dropping it releases the lock.
+    pub trait Lock: Send {}
+
+    pub struct Call {
+        pub path: PathBuf,
+        pub purpose: Purpose,
+        pub op: Op,
+    }
+    impl Call {
+        pub fn new(path: impl AsRef<Path>, purpose: Purpose, op: Op) -> Self;
+    }
+
+    #[non_exhaustive]
+    pub enum Op {
+        CreateDir,
+        Create,
+        Open,
+        Append(Vec<u8>),
+        Write(u64, Vec<u8>),
+        Read(u64, usize),
+        SyncData,
+        SyncAll,
+        SyncDir,
+        Truncate(u64),
+        Remove,
+        List,
+        Random(usize),
+    }
+
+    /// Why the log makes a call: a label to aim a fault at. A minor release may add one.
+    #[non_exhaustive]
+    pub enum Purpose {
+        Open, Group, Recovery, Lookup, Roll, Summary, KeyFilter, KeyIndex, Seal, LogFilter,
+        Repair, Close,
+    }
+
+    #[non_exhaustive]
+    pub enum Value {
+        Unit,
+        Length(u64),
+        Bytes(Vec<u8>),
+        Names(Vec<PathBuf>),
+    }
+
+    /// Every time the log reads.
+    pub trait Clock: Send + Sync {
+        /// From an origin the clock chooses. It never decreases. The linger runs on it.
+        fn monotonic(&self) -> Duration;
+        /// Milliseconds since the Unix epoch, for a group's append time. It may step back.
+        fn wall_millis(&self) -> u64;
+    }
+
+    /// A segment log that starts no thread.
+    pub struct SteppedLog { /* … */ }
+
+    impl SteppedLog {
+        /// Opens or creates the log as `SegmentLog::open` does, with recovery on the caller's
+        /// thread. Open loads the sealed key filters in segment order on that thread.
+        pub fn open(
+            dir: impl AsRef<Path>,
+            options: Options,
+            storage: Arc<dyn Storage>,
+            clock: Arc<dyn Clock>,
+        ) -> Result<SteppedLog, OpenError>;
+        pub fn append(&self, submit: Submit) -> Result<Pending, AppendError>;
+        pub fn watermark(&self) -> LogOffset;
+        pub fn stream_head(&self, stream: &[u8]) -> Option<StreamHead>;
+        pub fn read(&self, from: LogOffset, max: usize) -> Result<Vec<Record>, ReadError>;
+        /// Runs one step of a task.
+        pub fn step(&mut self, task: Task) -> Step;
+        /// Closes admission and marks the log for sealing, and returns at once.
+        pub fn seal(&mut self);
+        /// Closes admission as a drop of `SegmentLog` does.
+        pub fn close(&mut self);
+    }
+
+    #[non_exhaustive]
+    pub enum Task {
+        /// Takes queued submits, writes and flushes groups, rolls, seals and closes.
+        Writer,
+        /// Builds and writes a rolled segment's closing run.
+        Sealer,
+        /// Catches the log key filter up over the sealed segments.
+        KeyFilter,
+    }
+
+    pub enum Step {
+        Worked,
+        /// Nothing to do until the caller appends, closes or seals, or, for the writer, until the
+        /// clock's monotonic reading reaches `until`, the end of a group's linger.
+        Idle { until: Option<Duration> },
+        Stopped(Stop),
+    }
+
+    pub enum Stop {
+        /// `close` finished: the queue is drained and the close frame written.
+        Closed,
+        Sealed,
+        Poisoned,
+    }
+}
+```
+
+**The storage contract.** Each `Op` returns `Value::Unit` unless this list says otherwise, and a wrong value is an I/O error.
+
+- `CreateDir` and `Create` fail with `AlreadyExists` if the path exists. Open and the repair tool rely on that kind. `Create` makes an empty file.
+- `Open` returns the file's length as `Value::Length`.
+- `Append` writes at the end of the file. `Write` writes at a byte position and grows the file if needed.
+- `Read` returns `Value::Bytes` of at most the asked length from a position, short only at the end of the file.
+- `SyncData` and `SyncAll` flush a file. `SyncDir` makes a directory's entries durable. The log never retries a failed flush ([ADR 0004](../decisions/0004-io-errors-poison-the-writer.md)), so a storage may model writeback loss after one: the bytes stay readable, and a later successful flush does not make them durable unless they are written again.
+- `List` returns a directory's file names, sorted, as `Value::Names`.
+- `Random` returns that many bytes as `Value::Bytes`, for the log id.
+- A storage must treat an unknown `Purpose` like any other, and fail an unknown `Op`. A new `Op` ships only in a minor release, named in the changelog.
+- A storage or a clock must not call back into the log.
+
+The log's guarantees (I1–I10) hold for faults within the [storage contract](overview.md#storage-contract): an error, a short write that then fails, `StorageFull`, and a crash that loses unflushed bytes or tears unflushed sectors. A crash point is a call that the storage fails, after which it fails every call until the caller has built the crash image. The caller then drops the log.
+
+**Stepping.** A `SteppedLog` makes every storage call and clock reading inside one of its methods, and adds no randomness and no concurrency of its own. So the sequence of calls to it, the storage's results and the clock's readings fix a run. One writer step runs until the writer would wait, or after it has written and flushed one group, rolled, sealed, closed or poisoned. A roll ends a step, so that a sealer step can come between a roll and the next group. Where the threaded writer would wait for the sealer, at a roll with a run still pending, at a seal and at a close, the writer's step runs the sealer's job. A sealer step's failure poisons the writer at its next group boundary ([ADR 0067](../decisions/0067-the-sealer-writes-and-flushes-the-closing-run.md)). A key filter step's failure only stops the builder ([ADR 0051](../decisions/0051-a-log-key-filter-in-memory-in-front-of-the-segment-filters.md)). After `Stopped`, every step of every task returns the same value. A log that open finds sealed returns `Stopped(Sealed)`, and a sealed log releases its lock.
+
+`seal` stands behind every admitted submit, as `SegmentLog::seal` does, but it never waits for room in the accept queue. It does nothing after `close`. Poll answers with `Pending::try_wait`: `Pending::wait` on an unanswered request blocks forever, because no thread answers it.
+
+**Drop.** Dropping a `SteppedLog` makes no storage call and reads no clock: it is a crash. It writes no close frame. It drops the storage's lock guard, and every unanswered `Pending` returns `Indeterminate`. A clean drop is `close` followed by writer steps until `Stopped(Closed)`. After a crash, open a new `SteppedLog` on the same storage.
+
 ## Operator repair
 
 For 0.1 ([ADR 0065](../decisions/0065-the-repair-tool-truncates-only-the-newest-segment.md)); class F from 0.1.1 ([ADR 0068](../decisions/0068-open-refuses-damage-with-acknowledged-groups-after-it.md)); close-frame proofs from 0.2 ([ADR 0071](../decisions/0071-a-clean-drop-writes-a-close-frame.md)). This section is the only source for the command's subcommands, flags, exit codes and JSON output. After 0.1 they are public API. The core module behind it, `segment_log_core::repair`, is hidden and carries no promise.
@@ -339,7 +476,7 @@ Text output is for people and can change. `--json` prints one JSON object on std
 - Accept queue: `std::sync::mpsc::sync_channel` with `try_send` gives "refuse when full" without a dependency. Byte reservation must precede acceptance, and failed queue insertion must release it.
 - Lock: `std::fs::File::try_lock` (stable since Rust 1.89, an advisory lock).
 - Flush: `File::sync_data` for segments, and `sync_all` on an opened directory handle for directory entries. [ADR 0005](../decisions/0005-flush-calls-and-platforms.md) gives the mapping to system calls and what M1 must still verify.
-- All file I/O goes through a small storage trait, so that the tests can use simulated storage ([testing.md](testing.md)).
+- All file I/O goes through a small storage trait, so that the tests can use simulated storage ([testing.md](testing.md)). Every time the log reads goes through a clock. Both are public behind the `simulation` feature ([Simulation](#simulation)).
 - Reads on real storage: positioned reads on a shared handle (`std::os::unix::fs::FileExt::read_at`), so a reader never waits for a group flush. This limits the core to Unix targets, which are the supported platforms under [ADR 0005](../decisions/0005-flush-calls-and-platforms.md).
 - Log id: random bytes from the storage trait, as many as the `log_id` width in format.md. `std` has no public random source, and the simulated storage must make them deterministic from its seed.
 - CRC-32C: software tables that take eight input bytes per step are enough for M1. A version on processor instructions needs `unsafe` or a dependency, so it waits for an ADR and a measurement.

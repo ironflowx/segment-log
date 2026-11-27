@@ -144,6 +144,7 @@ struct State {
     /// The next reading, and how far each reading moves it. Both start at 0, so a test that
     /// builds a group's bytes by hand gives it append time 0.
     clock: (u64, i64),
+    origin: std::time::Instant,
 }
 #[derive(Clone)]
 pub(crate) struct Sim {
@@ -177,6 +178,7 @@ impl Sim {
                 held: None,
                 locks: BTreeSet::new(),
                 clock: (0, 0),
+                origin: std::time::Instant::now(),
             })),
         }
     }
@@ -267,13 +269,20 @@ impl Drop for Guard {
         s.trace.push(Event::Unlock(self.id));
     }
 }
-impl Storage for Sim {
-    fn now_millis(&self) -> u64 {
+/// The wall reading is the simulated clock. The monotonic reading is real time, because a
+/// threaded writer waits out its linger in real time.
+impl crate::clock::Clock for Sim {
+    fn monotonic(&self) -> Duration {
+        self.state.lock().unwrap().origin.elapsed()
+    }
+    fn wall_millis(&self) -> u64 {
         let mut s = self.state.lock().unwrap();
         let (now, step) = s.clock;
         s.clock.0 = now.saturating_add_signed(step);
         now
     }
+}
+impl Storage for Sim {
     fn call(&self, call: Call) -> io::Result<Value> {
         let (held, boot) = {
             let mut s = self.state.lock().unwrap();

@@ -9,8 +9,11 @@ pub(crate) mod sim;
 #[cfg(test)]
 mod tests;
 
+/// Why the log makes a call: a label a simulator can aim a fault at. A minor release may add a
+/// purpose, so treat an unknown one like any other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Purpose {
+#[non_exhaustive]
+pub enum Purpose {
     Open,
     Group,
     Recovery,
@@ -27,30 +30,43 @@ pub(crate) enum Purpose {
     /// A clean drop's close frame (ADR 0071).
     Close,
 }
+/// One file or directory operation. Each returns `Value::Unit` unless it says otherwise; a wrong
+/// value is an I/O error. The contract is in api.md (ADR 0072).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Op {
+#[non_exhaustive]
+pub enum Op {
+    /// Fails with `AlreadyExists` if the path exists.
     CreateDir,
+    /// Creates an empty file. Fails with `AlreadyExists` if the path exists.
     Create,
+    /// Returns the file's length as `Value::Length`.
     Open,
+    /// Writes at the end of the file.
     Append(Vec<u8>),
+    /// Writes at a byte position, growing the file if needed.
     Write(u64, Vec<u8>),
+    /// Returns `Value::Bytes` of at most this many bytes from a position, short only at the end
+    /// of the file.
     Read(u64, usize),
     SyncData,
     SyncAll,
+    /// Makes the directory's entries durable.
     SyncDir,
     Truncate(u64),
     Remove,
+    /// Returns the directory's file names, sorted, as `Value::Names`.
     List,
+    /// Returns this many random bytes as `Value::Bytes`, for the log id.
     Random(usize),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Call {
+pub struct Call {
     pub path: PathBuf,
     pub purpose: Purpose,
     pub op: Op,
 }
 impl Call {
-    pub(crate) fn new(path: impl AsRef<Path>, purpose: Purpose, op: Op) -> Self {
+    pub fn new(path: impl AsRef<Path>, purpose: Purpose, op: Op) -> Self {
         Self {
             path: path.as_ref().to_owned(),
             purpose,
@@ -59,22 +75,20 @@ impl Call {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Value {
+#[non_exhaustive]
+pub enum Value {
     Unit,
     Length(u64),
     Bytes(Vec<u8>),
     Names(Vec<PathBuf>),
 }
-pub(crate) trait Lock: Send {}
+/// The directory lock. Dropping it releases the lock.
+pub trait Lock: Send {}
+/// Every file and directory operation the log performs (ADR 0072). The log never retries a failed
+/// `SyncData`, `SyncAll` or `SyncDir` (ADR 0004). A storage must not call back into the log.
 // One command seam keeps recorded calls identical to the operations being simulated.
-pub(crate) trait Storage: Send + Sync {
+pub trait Storage: Send + Sync {
     fn call(&self, call: Call) -> io::Result<Value>;
+    /// Fails with `WouldBlock` while another guard holds the lock.
     fn lock(&self, path: &Path) -> io::Result<Box<dyn Lock>>;
-    /// Wall-clock milliseconds since the Unix epoch, for a group's append time. It sits on this
-    /// seam so that the simulation and the fixtures can fix it. A clock before 1970 reads 0.
-    fn now_millis(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-    }
 }

@@ -9,14 +9,45 @@ struct Metrics {
     timings: std::collections::BTreeMap<String, (u64, u64)>,
 }
 pub(super) struct Measured {
-    real: Real,
+    real: Clocked<Real>,
     verbose: bool,
     metrics: Mutex<Metrics>,
+}
+/// A storage with the system clock, as `SegmentLog::open` pairs them.
+pub(super) struct Clocked<S>(pub S, crate::clock::System);
+impl<S> Clocked<S> {
+    pub(super) fn new(storage: S) -> Self {
+        Self(storage, crate::clock::System::new())
+    }
+}
+impl<S: Storage> Storage for Clocked<S> {
+    fn call(&self, call: Call) -> io::Result<Value> {
+        self.0.call(call)
+    }
+    fn lock(&self, path: &Path) -> io::Result<Box<dyn Lock>> {
+        self.0.lock(path)
+    }
+}
+impl<S: Send + Sync> crate::clock::Clock for Clocked<S> {
+    fn monotonic(&self) -> Duration {
+        self.1.monotonic()
+    }
+    fn wall_millis(&self) -> u64 {
+        self.1.wall_millis()
+    }
+}
+impl crate::clock::Clock for Measured {
+    fn monotonic(&self) -> Duration {
+        self.real.monotonic()
+    }
+    fn wall_millis(&self) -> u64 {
+        self.real.wall_millis()
+    }
 }
 impl Measured {
     pub(super) fn new(verbose: bool) -> Self {
         Self {
-            real: Real::default(),
+            real: Clocked::new(Real::default()),
             verbose,
             metrics: Mutex::new(Metrics::default()),
         }
