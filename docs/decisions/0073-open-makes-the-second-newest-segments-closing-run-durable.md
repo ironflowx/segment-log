@@ -39,7 +39,7 @@ These facts are fixed:
 When the newest segment is not sealed and the second-newest's run was proved, not rebuilt, open reads the bytes from the footer to the end of the file, writes them back in place, and calls `sync_all`, as ADR 0015 does for the tail.
 
 - **For:** the same identical rewrite that ADR 0015 already relies on, with the same sector-atomicity assumption. It reads only the footer and the locator, so `ORACLE-13` holds.
-- **Against:** one write of the footer and locator (their widths are in [format.md](../architecture/format.md)), and one more `sync_all` at each writable open of a log with more than one segment, even when the run was durable all along.
+- **Against:** at each writable open of a log with more than one segment, even when the run was durable all along: one more file open, a read from the footer to the end of the file, one write of those bytes (the footer and locator; their widths are in [format.md](../architecture/format.md)), and one more `sync_all`.
 
 ### Option B - only `sync_all` the second-newest segment
 
