@@ -69,6 +69,7 @@ This option gives each submit the wait that ADR 0002 already promised, without a
 
 ## Consequences
 
+- [ADR 0072](0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md) amends this decision: `append` stamps a request with the log's clock, and the linger reads that clock, not `Instant` directly.
 - This decision amends ADR 0002: the linger is a bound on the wait of a group's first submit, not a pause that the writer adds after each flush.
 - This decision amends ADR 0043: a zero linger takes the submits admitted before the writer started to take them, not every submit that arrives while it does.
 - The worst wait before a group is written falls by up to one flush. In the [linger record](../evidence/issue20/linger-admission/README.md), at the paced rate, the p50 fell in 20 pairs of 20, from 1.52–1.65 ms to 1.17–1.18 ms on a hosted Linux runner and from 1.28 to 1.02 ms on a Docker guest. The p99 fell where slow flushes did not set it.
