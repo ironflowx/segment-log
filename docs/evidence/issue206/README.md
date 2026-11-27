@@ -37,11 +37,11 @@ Capture 1's m3 run (46047265506) and a run on `main` (46048389862) both failed t
 
 ## Verdict
 
-The real path keeps its calls. By the rule set before the run, both hosted captures miss: capture 2 misses only paced p50, by 3 µs, and capture 1 misses three measures. **A paired run on a dedicated host is pending** ([owner's decision on pull request 208](https://github.com/ironflowx/segment-log/pull/208)), as for [issue 200](../issue200/README.md). Its numbers will be judged against the same rule, and this record will replace the verdict.
+The real path keeps its calls. By the rule set before the run, both hosted captures miss: capture 2 misses only paced p50, by 3 µs, and capture 1 misses three measures. On 2026-11-27 the owner accepted that miss and merged [pull request 208](https://github.com/ironflowx/segment-log/pull/208) on these hosted captures. A paired run on a dedicated host, as for [issue 200](../issue200/README.md), is optional follow-up. If it runs, its numbers are judged against the same rule and added here.
 
 ## Dedicated-host procedure
 
-[paired.sh](paired.sh) runs on the host. The controller steps around it:
+For that follow-up, [paired.sh](paired.sh) runs on the host. The controller steps around it:
 
 1. Check EPYC availability on Hetzner's public auction data, and order an EPYC box with two NVMe drives and a primary IPv4 address, as for issue 200.
 2. Bootstrap it from the rescue system: `M7_HOST=root@<ip> scripts/m7-session.sh bootstrap`. That gives Debian 12 on the first drive and `/tmp` as ext4 on the second.
