@@ -61,7 +61,7 @@ The footprint is about a 1 MB binary and a 1,240 KiB idle resident set ([M6](doc
 ```sh
 cargo add segment-log-core                  # the library
 cargo install segment-log-server            # the server; or the Linux musl binary from the GitHub release
-go get github.com/ironflowx/segment-log/clients/go@v0.2.1   # the Go client
+go get github.com/ironflowx/segment-log/clients/go@v0.3.0   # the Go client
 ```
 
 ```rust

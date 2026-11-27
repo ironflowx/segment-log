@@ -32,6 +32,7 @@ pub(super) fn open(
     dir: &Path,
     hash: impl FnOnce(codec::LogId) -> KeyHash,
     version: u16,
+    parallel: bool,
 ) -> Result<Recovered, OpenError> {
     match call(storage, dir, Purpose::Open, Op::CreateDir) {
         Ok(_) => (),
@@ -107,7 +108,7 @@ pub(super) fn open(
         Ending::Groups | Ending::Stopped => found.sealed.clone(),
     };
     // Step 11's reads come before any change, so that a bad key filter changes no file.
-    let mut sealed_keys = SealedKeys::load_all(&reader, dir, &found.log_id, &summaries)?;
+    let mut sealed_keys = SealedKeys::load_all(&reader, dir, &found.log_id, &summaries, parallel)?;
 
     // The rebuilt closing run is the first change, so the newest segment's own recovery below
     // happens with every older segment sealed (ADR 0061, rule 8).

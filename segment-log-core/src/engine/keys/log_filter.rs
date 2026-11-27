@@ -70,6 +70,9 @@ pub(crate) enum Mode {
     Inline,
     #[cfg_attr(not(test), allow(dead_code))]
     Off,
+    /// As key filter steps that the caller schedules (ADR 0072).
+    #[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))]
+    Task,
 }
 
 /// The builder's state. It adds sealed segments to `building` in order, and gives the writer a
@@ -177,6 +180,12 @@ enum Run {
         build: Box<Build>,
         ready: Option<Arc<LogFilter>>,
     },
+    /// `due` while a step has segments to catch up on.
+    Task {
+        build: Box<Build>,
+        ready: Option<Arc<LogFilter>>,
+        due: bool,
+    },
 }
 
 impl Builder {
@@ -205,6 +214,11 @@ impl Builder {
                 build.catch_up(&stop, &mut |filter| ready = Some(filter));
                 Run::Inline { build, ready }
             }
+            Mode::Task => Run::Task {
+                build,
+                ready: None,
+                due: true,
+            },
             Mode::Background => {
                 let (rolls, rolled) = mpsc::channel::<Arc<SealedKeys>>();
                 let (send, filters) = mpsc::channel();
@@ -245,14 +259,31 @@ impl Builder {
                 build.segments.push(segment);
                 build.catch_up(&self.stop, &mut |filter| *ready = Some(filter));
             }
+            Run::Task { build, due, .. } => {
+                build.segments.push(segment);
+                *due = true;
+            }
         }
+    }
+
+    /// A key filter step. Reports whether it had segments to catch up on.
+    #[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))]
+    pub(super) fn step(&mut self) -> bool {
+        let Run::Task { build, ready, due } = &mut self.run else {
+            return false;
+        };
+        if !std::mem::take(due) {
+            return false;
+        }
+        build.catch_up(&self.stop, &mut |filter| *ready = Some(filter));
+        true
     }
 
     /// The newest filter that the builder has handed over since the last call.
     pub(super) fn ready(&mut self) -> Option<Arc<LogFilter>> {
         match &mut self.run {
             Run::Background { filters, .. } => filters.try_iter().last(),
-            Run::Inline { ready, .. } => ready.take(),
+            Run::Inline { ready, .. } | Run::Task { ready, .. } => ready.take(),
         }
     }
 }

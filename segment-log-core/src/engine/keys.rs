@@ -136,15 +136,19 @@ impl SealedKeys {
         dir: &Path,
         log_id: &codec::LogId,
         summaries: &[SealedSummary],
+        parallel: bool,
     ) -> Result<Vec<Self>, OpenError> {
         let load_run = |run: &[SealedSummary]| {
             run.iter()
                 .map(|&summary| Self::load(storage, dir, log_id, summary))
                 .collect::<Result<Vec<_>, _>>()
         };
-        let threads = thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(summaries.len());
+        // A stepped log loads on the caller's thread, so that a seed fixes the order (ADR 0072).
+        let threads = match parallel {
+            true => thread::available_parallelism().map_or(1, |n| n.get()),
+            false => 1,
+        }
+        .min(summaries.len());
         if threads <= 1 {
             return load_run(summaries);
         }
@@ -355,6 +359,12 @@ impl Keys {
         if let Some(filter) = self.builder.as_mut().and_then(Builder::ready) {
             self.log = Some(filter);
         }
+    }
+
+    /// A key filter step (ADR 0072). Reports whether it did work.
+    #[cfg_attr(not(any(test, feature = "simulation")), allow(dead_code))]
+    pub(super) fn step_builder(&mut self) -> bool {
+        self.builder.as_mut().is_some_and(Builder::step)
     }
 
     /// A poisoned writer looks up no key again, so its builder has nothing left to serve.

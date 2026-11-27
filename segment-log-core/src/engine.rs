@@ -1,4 +1,5 @@
 use crate::{
+    clock::{self, Clock},
     codec,
     storage::{self, Call, Lock, Op, Purpose, Storage, Value},
     *,
@@ -9,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, mpsc},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::Duration,
 };
 mod closing;
 #[cfg(fuzzing)]
@@ -29,7 +30,13 @@ pub use reply::Pending;
 #[cfg(test)]
 pub(crate) use view::frame_table_charge;
 use view::{GroupSpan, Published, View};
-use writer::{Active, Writer, run};
+use writer::{Active, Machine, SealMode, Writer};
+#[cfg(any(test, feature = "simulation"))]
+mod stepped;
+#[cfg(any(test, feature = "simulation"))]
+pub use stepped::{Step, SteppedLog, Task};
+#[cfg(any(test, feature = "simulation"))]
+pub use writer::Stop;
 
 fn segment_path(dir: &Path, base: u64) -> PathBuf {
     dir.join(format!("{base:020}.seg"))
@@ -49,8 +56,9 @@ struct Request {
     submit: Submit,
     reply: reply::Reply,
     reservation: Reservation,
-    /// When `append` queued the request. A group's linger runs from this instant of its first submit.
-    admitted: Instant,
+    /// When `append` queued the request, on the log's monotonic clock. A group's linger runs from
+    /// this instant of its first submit.
+    admitted: Duration,
 }
 struct RetryWaiter {
     request: Request,
@@ -113,13 +121,8 @@ pub(crate) struct KeyMemory {
 }
 pub struct SegmentLog {
     view: Arc<View>,
-    gate: RwLock<Gate>,
+    admission: Admission,
     lifecycle: Mutex<Lifecycle>,
-    poisoned: Arc<std::sync::atomic::AtomicBool>,
-    options: Arc<Options>,
-    used: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
-    peak: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     drop_closed: Option<mpsc::Sender<()>>,
     #[cfg(test)]
@@ -133,6 +136,17 @@ pub struct SegmentLog {
 enum Gate {
     Open(mpsc::SyncSender<Message>),
     Closed,
+}
+
+/// What `append` checks and charges, shared by `SegmentLog` and `SteppedLog`.
+struct Admission {
+    gate: RwLock<Gate>,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+    options: Arc<Options>,
+    used: Arc<std::sync::atomic::AtomicUsize>,
+    clock: Arc<dyn Clock>,
+    #[cfg(test)]
+    peak: std::sync::atomic::AtomicUsize,
 }
 
 enum Lifecycle {
@@ -153,31 +167,157 @@ enum Message {
     Seal(mpsc::Sender<()>),
 }
 
+/// Where each piece of background work runs.
+struct Modes {
+    log_filter: LogFilterMode,
+    sealer: SealMode,
+    /// No thread at all: the caller schedules every step (ADR 0072).
+    stepped: bool,
+}
+
+/// An opened log before anything runs it.
+struct Prepared {
+    view: Arc<View>,
+    admission: Admission,
+    writing: Option<(Machine, Box<dyn Lock>)>,
+    #[cfg(test)]
+    memory: Arc<Mutex<KeyMemory>>,
+    #[cfg(test)]
+    rolls: Arc<Mutex<Vec<std::time::Duration>>>,
+}
+
+fn prepare(
+    dir: &Path,
+    options: Options,
+    storage: Arc<dyn Storage>,
+    clock: Arc<dyn Clock>,
+    hash: impl FnOnce(codec::LogId) -> KeyHash,
+    limits: Limits,
+    modes: Modes,
+) -> Result<Prepared, OpenError> {
+    if options.queue_capacity == 0 || options.pending_byte_budget == 0 {
+        return Err(OpenError::InvalidOptions("capacities must be positive"));
+    }
+    // The smallest valid group: one record, a one-byte stream id, no key, an empty payload.
+    if !(codec::GROUP_HEADER_LEN + 17..=codec::GROUP_BODY_LIMIT).contains(&options.group_byte_cap) {
+        return Err(OpenError::InvalidOptions("group byte cap outside limits"));
+    }
+    if options.roll_bytes == 0 || options.roll_bytes > codec::ROLL_BYTES_LIMIT {
+        return Err(OpenError::InvalidOptions("roll bytes outside limits"));
+    }
+    let options = Arc::new(options);
+    let recovery::Recovered {
+        log_id,
+        hash,
+        published,
+        state,
+    } = recovery::open(
+        storage.as_ref(),
+        dir,
+        hash,
+        limits.format_version,
+        !modes.stepped,
+    )?;
+    let view = Arc::new(View {
+        storage,
+        dir: dir.to_owned(),
+        log_id,
+        published: Mutex::new(published),
+        tables: Mutex::default(),
+    });
+    let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let memory = Arc::new(Mutex::new(KeyMemory::default()));
+    #[cfg(test)]
+    let rolls = Arc::new(Mutex::new(Vec::new()));
+    let (gate, writing) = match state {
+        recovery::State::Sealed => (Gate::Closed, None),
+        recovery::State::Writable(writable) => {
+            let writable = *writable;
+            let mut keys = Keys::new(
+                hash,
+                writable.active_keys,
+                writable.sealed_keys,
+                options.roll_bytes,
+            );
+            // Open's own reads are done, so the build's reads come after them.
+            keys.start_building(&view, modes.log_filter);
+            #[cfg(test)]
+            {
+                *memory.lock().unwrap() = keys.memory();
+            }
+            let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
+            let writer = Writer {
+                epoch: writable.epoch,
+                append_time: writable.append_time,
+                keys,
+                active: writable.active,
+                limits,
+                sealer: modes.sealer,
+                pending: None,
+                #[cfg(test)]
+                memory: memory.clone(),
+                #[cfg(test)]
+                rolls: rolls.clone(),
+            };
+            let machine = Machine::new(
+                view.clone(),
+                poisoned.clone(),
+                writer,
+                receiver,
+                options.clone(),
+                clock.clone(),
+                modes.stepped,
+            );
+            (Gate::Open(sender), Some((machine, writable.lock)))
+        }
+    };
+    Ok(Prepared {
+        view,
+        admission: Admission {
+            gate: RwLock::new(gate),
+            poisoned,
+            options,
+            used: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clock,
+            #[cfg(test)]
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        },
+        writing,
+        #[cfg(test)]
+        memory,
+        #[cfg(test)]
+        rolls,
+    })
+}
+
 impl SegmentLog {
     pub fn open(dir: impl AsRef<Path>, options: Options) -> Result<Self, OpenError> {
         Self::start(
             dir.as_ref(),
             options,
             Arc::new(storage::real::Real::default()),
+            Arc::new(clock::System::new()),
             KeyHash::new,
             Limits::default(),
             LogFilterMode::Background,
-            true,
+            SealMode::Thread,
         )
     }
+    /// The storage is also the clock, so that a test fixes the append time with its storage.
     #[cfg(test)]
-    pub(crate) fn with_storage(
+    pub(crate) fn with_storage<S: Storage + Clock + 'static>(
         dir: &Path,
         options: Options,
-        storage: Arc<dyn Storage>,
+        storage: Arc<S>,
     ) -> Result<Self, OpenError> {
         Self::with_hooks(dir, options, storage, Hooks::default())
     }
     #[cfg(test)]
-    pub(crate) fn with_hooks(
+    pub(crate) fn with_hooks<S: Storage + Clock + 'static>(
         dir: &Path,
         options: Options,
-        storage: Arc<dyn Storage>,
+        storage: Arc<S>,
         hooks: Hooks,
     ) -> Result<Self, OpenError> {
         let Hooks {
@@ -187,117 +327,60 @@ impl SegmentLog {
             background_seal,
         } = hooks;
         let hash = |log_id| KeyHash::new(log_id).forcing(key_hashes);
+        let sealer = match background_seal {
+            true => SealMode::Thread,
+            false => SealMode::Inline,
+        };
         Self::start(
             dir,
             options,
+            storage.clone(),
             storage,
             hash,
             limits,
             log_filter,
-            background_seal,
+            sealer,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn start(
         dir: &Path,
         options: Options,
         storage: Arc<dyn Storage>,
+        clock: Arc<dyn Clock>,
         hash: impl FnOnce(codec::LogId) -> KeyHash,
         limits: Limits,
         log_filter: LogFilterMode,
-        background_seal: bool,
+        sealer: SealMode,
     ) -> Result<Self, OpenError> {
-        if options.queue_capacity == 0 || options.pending_byte_budget == 0 {
-            return Err(OpenError::InvalidOptions("capacities must be positive"));
-        }
-        // The smallest valid group: one record, a one-byte stream id, no key, an empty payload.
-        if !(codec::GROUP_HEADER_LEN + 17..=codec::GROUP_BODY_LIMIT)
-            .contains(&options.group_byte_cap)
-        {
-            return Err(OpenError::InvalidOptions("group byte cap outside limits"));
-        }
-        if options.roll_bytes == 0 || options.roll_bytes > codec::ROLL_BYTES_LIMIT {
-            return Err(OpenError::InvalidOptions("roll bytes outside limits"));
-        }
-        let options = Arc::new(options);
-        let recovery::Recovered {
-            log_id,
-            hash,
-            published,
-            state,
-        } = recovery::open(storage.as_ref(), dir, hash, limits.format_version)?;
-        let view = Arc::new(View {
-            storage,
-            dir: dir.to_owned(),
-            log_id,
-            published: Mutex::new(published),
-            tables: Mutex::default(),
-        });
-        let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        #[cfg(test)]
-        let memory = Arc::new(Mutex::new(KeyMemory::default()));
-        #[cfg(test)]
-        let rolls = Arc::new(Mutex::new(Vec::new()));
-        let (gate, lifecycle) = match state {
-            recovery::State::Sealed => (Gate::Closed, Lifecycle::Sealed),
-            recovery::State::Writable(writable) => {
-                let writable = *writable;
-                let mut keys = Keys::new(
-                    hash,
-                    writable.active_keys,
-                    writable.sealed_keys,
-                    options.roll_bytes,
-                );
-                // Open's own reads are done, so the build's reads come after them.
-                keys.start_building(&view, log_filter);
-                #[cfg(test)]
-                {
-                    *memory.lock().unwrap() = keys.memory();
-                }
-                let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
-                let writer_view = view.clone();
-                let writer_poisoned = poisoned.clone();
-                let writer_options = options.clone();
-                #[cfg(test)]
-                let writer_memory = memory.clone();
-                #[cfg(test)]
-                let writer_rolls = rolls.clone();
+        let modes = Modes {
+            log_filter,
+            sealer,
+            stepped: false,
+        };
+        let Prepared {
+            view,
+            admission,
+            writing,
+            #[cfg(test)]
+            memory,
+            #[cfg(test)]
+            rolls,
+        } = prepare(dir, options, storage, clock, hash, limits, modes)?;
+        let lifecycle = match writing {
+            None => Lifecycle::Sealed,
+            Some((machine, lock)) => {
                 let writer = thread::Builder::new()
                     .name("segment-log-writer".into())
-                    .spawn(move || {
-                        run(
-                            writer_view,
-                            writer_poisoned,
-                            receiver,
-                            Writer {
-                                epoch: writable.epoch,
-                                append_time: writable.append_time,
-                                keys,
-                                active: writable.active,
-                                limits,
-                                background_seal,
-                                pending: None,
-                                #[cfg(test)]
-                                memory: writer_memory,
-                                #[cfg(test)]
-                                rolls: writer_rolls,
-                            },
-                            writer_options,
-                        );
-                    })
+                    .spawn(move || writer::run(machine))
                     .map_err(OpenError::Io)?;
-                let lock = writable.lock;
-                (Gate::Open(sender), Lifecycle::Writing { writer, lock })
+                Lifecycle::Writing { writer, lock }
             }
         };
         Ok(Self {
             view,
-            gate: RwLock::new(gate),
+            admission,
             lifecycle: Mutex::new(lifecycle),
-            poisoned,
-            options,
-            used: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            peak: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             drop_closed: None,
             #[cfg(test)]
@@ -342,6 +425,53 @@ impl SegmentLog {
         }
     }
     pub fn append(&self, submit: Submit) -> Result<Pending, AppendError> {
+        self.admission.append(submit)
+    }
+
+    pub fn seal(&self) -> Result<(), SealError> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        let (writer, lock) = match std::mem::replace(&mut *lifecycle, Lifecycle::Sealed) {
+            Lifecycle::Sealed => return Ok(()),
+            stopped @ Lifecycle::Stopped { .. } => {
+                *lifecycle = stopped;
+                return Err(SealError::Poisoned);
+            }
+            Lifecycle::Writing { writer, lock } => (writer, lock),
+        };
+        // The write lock ends with this statement, before the send, which can wait for queue room
+        // that `append` must never wait for.
+        let gate = std::mem::replace(&mut *self.admission.gate.write().unwrap(), Gate::Closed);
+        let Gate::Open(sender) = gate else {
+            unreachable!("a running writer's gate is open")
+        };
+        let (reply, sealed) = mpsc::channel();
+        let sent = sender.send(Message::Seal(reply)).is_ok();
+        drop(sender);
+        let sealed = sent && sealed.recv().is_ok();
+        let _ = writer.join();
+        if sealed {
+            drop(lock);
+            Ok(())
+        } else {
+            self.admission
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            *lifecycle = Lifecycle::Stopped { _lock: lock };
+            Err(SealError::Poisoned)
+        }
+    }
+    pub fn watermark(&self) -> LogOffset {
+        self.view.watermark()
+    }
+    pub fn stream_head(&self, stream: &[u8]) -> Option<StreamHead> {
+        self.view.stream_head(stream)
+    }
+    pub fn read(&self, from: LogOffset, max: usize) -> Result<Vec<Record>, ReadError> {
+        self.view.read(from, max)
+    }
+}
+impl Admission {
+    fn append(&self, submit: Submit) -> Result<Pending, AppendError> {
         #[cfg(test)]
         crate::pipeline::request(&submit, crate::pipeline::ADMISSION);
         validate(&submit)?;
@@ -384,58 +514,17 @@ impl SegmentLog {
             submit,
             reply,
             reservation,
-            admitted: Instant::now(),
+            admitted: self.clock.monotonic(),
         })) {
             Ok(()) => Ok(pending),
             Err(mpsc::TrySendError::Full(_)) => Err(AppendError::Full),
             Err(mpsc::TrySendError::Disconnected(_)) => Err(AppendError::Poisoned),
         }
     }
-
-    pub fn seal(&self) -> Result<(), SealError> {
-        let mut lifecycle = self.lifecycle.lock().unwrap();
-        let (writer, lock) = match std::mem::replace(&mut *lifecycle, Lifecycle::Sealed) {
-            Lifecycle::Sealed => return Ok(()),
-            stopped @ Lifecycle::Stopped { .. } => {
-                *lifecycle = stopped;
-                return Err(SealError::Poisoned);
-            }
-            Lifecycle::Writing { writer, lock } => (writer, lock),
-        };
-        // The write lock ends with this statement, before the send, which can wait for queue room
-        // that `append` must never wait for.
-        let gate = std::mem::replace(&mut *self.gate.write().unwrap(), Gate::Closed);
-        let Gate::Open(sender) = gate else {
-            unreachable!("a running writer's gate is open")
-        };
-        let (reply, sealed) = mpsc::channel();
-        let sent = sender.send(Message::Seal(reply)).is_ok();
-        drop(sender);
-        let sealed = sent && sealed.recv().is_ok();
-        let _ = writer.join();
-        if sealed {
-            drop(lock);
-            Ok(())
-        } else {
-            self.poisoned
-                .store(true, std::sync::atomic::Ordering::Release);
-            *lifecycle = Lifecycle::Stopped { _lock: lock };
-            Err(SealError::Poisoned)
-        }
-    }
-    pub fn watermark(&self) -> LogOffset {
-        self.view.watermark()
-    }
-    pub fn stream_head(&self, stream: &[u8]) -> Option<StreamHead> {
-        self.view.stream_head(stream)
-    }
-    pub fn read(&self, from: LogOffset, max: usize) -> Result<Vec<Record>, ReadError> {
-        self.view.read(from, max)
-    }
 }
 impl Drop for SegmentLog {
     fn drop(&mut self) {
-        *self.gate.get_mut().unwrap() = Gate::Closed;
+        *self.admission.gate.get_mut().unwrap() = Gate::Closed;
         #[cfg(test)]
         if let Some(observer) = self.drop_closed.take() {
             let _ = observer.send(());
@@ -557,14 +646,18 @@ pub(crate) mod admission_support {
             + std::mem::size_of::<reply::Slot>()
     }
     pub(crate) fn peak(log: &SegmentLog) -> usize {
-        log.peak.load(std::sync::atomic::Ordering::Relaxed)
+        log.admission
+            .peak
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub(crate) fn used(log: &SegmentLog) -> usize {
-        log.used.load(std::sync::atomic::Ordering::Acquire)
+        log.admission
+            .used
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     pub(crate) fn finish(log: &mut SegmentLog, panicked: bool) {
         if !panicked {
-            *log.gate.get_mut().unwrap() = Gate::Closed;
+            *log.admission.gate.get_mut().unwrap() = Gate::Closed;
         }
         let lifecycle = std::mem::replace(log.lifecycle.get_mut().unwrap(), Lifecycle::Sealed);
         let Lifecycle::Writing { writer, lock } = lifecycle else {

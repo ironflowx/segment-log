@@ -2,15 +2,24 @@
 
 Each release lists its API breaks with a migration note, its format version bumps and the protocol versions it speaks ([ADR 0064](docs/decisions/0064-the-0-1-compatibility-promise.md)). The crates and the Go client (`clients/go/vX.Y.Z`) share one version.
 
-## Unreleased
+## 0.3.0 - 2026-11-27
+
+- **Speaks protocol versions:** 2.
+
+### Added
+
+- **A `simulation` feature for deterministic simulation** ([issue 206](https://github.com/ironflowx/segment-log/issues/206), [ADR 0072](docs/decisions/0072-a-simulator-drives-the-log-through-public-storage-a-clock-and-steps.md), [api.md](docs/architecture/api.md#simulation)). Off by default, it adds `segment_log_core::simulation`: the `Storage` trait that every file operation goes through, a `Clock` trait for every time the log reads, and `SteppedLog`, a log that starts no thread. Its writer, sealer and key filter builder run only when the caller calls `step(Task)`, so one seed that fixes the calls, the storage's results and the clock's readings fixes a whole run. Dropping a `SteppedLog` is a crash, and `SteppedLog::open` on the same storage recovers. The feature adds items only: with it on or off, `SegmentLog` behaves the same. A new `Op` variant will come only in a minor release and be named here, because a storage must handle it.
 
 ### Changed
 
+- **`SegmentLog`'s writer thread runs the same steps as `SteppedLog`.** The writer loop is now a state machine that ends each step where the thread would wait; the thread loops over its steps. The storage calls and their order are unchanged ([record](docs/evidence/issue206/README.md)).
 - **A segment that outgrows its key index no longer moves every key at once** ([issue 200](https://github.com/ironflowx/segment-log/issues/200)). The active key map's index is 64 small maps instead of one, so an insert that grows one moves about 1/64 of the keys on the writer. An index can take up to about 2 MiB more in a full segment. On a slowed EPYC 7502P, the longest pause when a segment outgrows its index falls from 18 to 1.3 ms ([record](docs/evidence/issue200/README.md)). No API or format change.
 
 ### Fixed
 
 - **Open now makes a rolled segment's closing run durable when it finds it only in the page cache** ([ADR 0073](docs/decisions/0073-open-makes-the-second-newest-segments-closing-run-durable.md)). If the process died after the sealer wrote a closing run's footer and locator but before their flush, or that flush failed, the next open read them from the page cache, trusted them and never flushed them. Once the log rolled past that segment, a power loss could drop them, and every later open failed with `Corrupt`. Open now rewrites the second-newest segment's footer and locator in place and calls `sync_all`, as it already rewrites the newest segment's tail ([ADR 0015](docs/decisions/0015-open-makes-the-recovered-tail-durable.md)). That costs one file open, one small read, one small write and one flush at each writable open of a log with more than one segment. A log that an older build already rolled past such a run is not repaired by this open; if power is lost, run the repair tool. No API or format change.
+
+No API break. No format change. The protocol versions are unchanged.
 
 ## 0.2.1 - 2026-11-23
 

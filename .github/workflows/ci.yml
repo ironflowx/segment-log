@@ -42,6 +42,9 @@ jobs:
       - run: cargo test --workspace
         env:
           SEGMENT_LOG_TEST_ROLL_BYTES: 256
+      # The public simulation API and its seeded crash test, behind its feature (ADR 0072).
+      - run: cargo clippy --workspace --all-targets --features segment-log-core/simulation -- -D warnings
+      - run: cargo test --workspace --features segment-log-core/simulation
       - run: python3 -m unittest discover -s scripts -p 'test_m*.py'
 
   # The workspace builds and passes its tests at the declared rust-version (ADR 0064, rule 16).
@@ -78,6 +81,18 @@ jobs:
         with:
           baseline-rev: ${{ steps.baseline.outputs.tag }}
           rust-toolchain: manual
+      # The simulation module is public API behind its feature (ADR 0072). The check skips it
+      # until the baseline tag has the feature.
+      - if: steps.baseline.outputs.tag != ''
+        run: echo "has_simulation=$(git show ${{ steps.baseline.outputs.tag }}:segment-log-core/Cargo.toml | grep -c '^simulation = ')" >> "$GITHUB_OUTPUT"
+        id: simulation
+      - if: steps.baseline.outputs.tag != '' && steps.simulation.outputs.has_simulation != '0'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.baseline.outputs.tag }}
+          rust-toolchain: manual
+          package: segment-log-core
+          features: simulation
 
   # The shared conformance cases over the Unix socket, run by the Go test client (ADR 0058).
   conformance:

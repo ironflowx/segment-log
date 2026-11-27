@@ -23,6 +23,15 @@ impl ReadOnlyVolume {
     }
 }
 
+impl crate::clock::Clock for ReadOnlyVolume {
+    fn monotonic(&self) -> std::time::Duration {
+        self.sim.monotonic()
+    }
+    fn wall_millis(&self) -> u64 {
+        self.sim.wall_millis()
+    }
+}
+
 impl Storage for ReadOnlyVolume {
     fn call(&self, call: Call) -> io::Result<Value> {
         if matches!(call.op, Op::Open | Op::Read(..) | Op::List) {

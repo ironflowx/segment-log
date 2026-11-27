@@ -12,6 +12,14 @@ readme = "README.md"
 # Test-only: open's rewrite of the recovered tail writes one changed byte, the known-bad control of
 # VOL-POWER-CUT-RECOVERY (volume-requirements.md, V2). Never in a release build.
 rewrite-control = []
+# The storage trait, the clock and `SteppedLog`, for a deterministic simulator (ADR 0072). Off by
+# default; it adds items only, and changes nothing that `SegmentLog` does.
+simulation = []
+
+# The public simulation API, from outside the crate (ADR 0072).
+[[test]]
+name = "simulation"
+required-features = ["simulation"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
