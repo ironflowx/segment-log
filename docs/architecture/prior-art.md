@@ -60,10 +60,10 @@ These numbers come from third-party tests and forum posts, found on 7 November 2
 | Redpanda, `acks=all` | 39K records/s in the same test. Redpanda's own benchmarks claim an `fsync` per batch and lower tail latency. | Partly. [Vanlightly](https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up) found the vendor's Kafka setup skewed. |
 | NATS JetStream, `sync_interval: always` | "A few hundred msg/s" ([docs PR](https://github.com/nats-io/nats.docs/pull/896/files)). 158 msg/s in a [Dart client test](https://pub.dev/documentation/rk_nats/0.2.2/). | In kind, with no group commit. |
 | NATS JetStream, default | About 32K msg/s sync publish, about 370K async ([2.14 RC post](https://qaze.pages.dev/blog/nats-fast-ingest-batch-publish)) | No. The default `fsync` interval is 2 minutes. |
-| SQLite, WAL, `synchronous=FULL` | About 9K transactions/s on NVMe, 6 inserts each ([forum](https://sqlite.org/forum/forumpost/c872a3333f)). About 270/s on old Android storage. | Embedded, with no group commit across callers. |
+| SQLite, WAL, `synchronous=FULL` | About 2,450 commits/s with `FULL` and about 48,000/s with `NORMAL`. The `fsync` was 0.28 ms, on a Hetzner cpx32 with SQLite 3.45.1, through Python ([Martini](https://mitjamartini.com/en/posts/2026/10/sqlite-resilience-on-hetzner/)). 5,535 commits/s with `FULL`, p50 0.111 ms and p99 0.489 ms ([ZeroExp](https://zeroexp.dev/library/sqlite-synchronous-normal)). | Embedded, with no group commit across callers. |
 | EventStoreDB | About 65 appends/s for one sequential client. About 25K events/s with 1,000-event batches. Both are derived from an [old forum post](https://discuss.eventstore.com/t/eventstoredb-performance-comparison/5068). | Similar contract. Old, with no version stated. |
 
-No source gave open time, exit time, idle resident set or binary size for a comparable system.
+SQLite publishes a library footprint of about 650 KB ([footprint](https://sqlite.org/footprint.html)). The [Kafka and Redpanda test](https://computingforgeeks.com/kafka-vs-redpanda-benchmarks/) measured Kafka at 1,215 MB idle with a 5.1 s startup, and Redpanda at 3,420 MB idle with a 2.7 s startup.
 
 ## Evidence limits
 

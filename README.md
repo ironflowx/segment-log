@@ -42,6 +42,20 @@ The issue 49 host's paced p99 missed its bound because sealing at roll stalled t
 
 Reader numbers are from the [issue 177 record](docs/evidence/issue177/README.md), after [ADR 0069](docs/decisions/0069-reads-keep-sparse-frame-tables-under-a-byte-budget.md) replaced the 16 frame tables with sparse tables. Measured on 2026-11-20 on an Apple M4 Mac mini (10 cores, 24 GiB, Darwin 27.2.0, APFS on an external Samsung PSSD P7, firmware SXGD0PCQ, PCI-Express), rustc 1.100.0, release build. One reader through `LogReader` read a sealed log of 10,000,000 keyed 256-byte records (43 segments) for 10 s, 64 records per call, 3 runs. A scan took 191 µs p50 (392,102 records/s). A random read took 209 µs p50. On the same host, before the change, that random read took 1,191 µs p50. The [issue 156 record](docs/evidence/issue156/README.md#frame-tables) measured 1,466 µs p50 for a random read of 43 sealed segments on the Mac's internal SSD, when a log kept 16 frame tables. A Mac on APFS is not the deployment stack. On an EPYC 7502P with Samsung PM9A3 drives, every log resident, the 43-segment log took 301 µs p50 for both a random read and a scan (199,791 records/s) ([Linux rerun](docs/evidence/issue177/README.md#linux-rerun)). No EPYC 7401P was on offer, so that rerun is a confirmation on similar hardware, not on the qualified host.
 
+### How this compares
+
+The numbers come from different hardware.
+
+| Durability | System | Reported |
+| --- | --- | --- |
+| `fsync` before ack | segment-log | 62,203 to 228,592 rec/s ([issue 49](docs/evidence/issue49/README.md), [issue 154](docs/evidence/issue154/README.md)) |
+| `fsync` before ack | SQLite WAL, `synchronous=FULL` | about 2,450 to 5,535 commits/s ([Martini](https://mitjamartini.com/en/posts/2026/10/sqlite-resilience-on-hetzner/), [ZeroExp](https://zeroexp.dev/library/sqlite-synchronous-normal)) |
+| `fsync` before ack | NATS JetStream, sync always | 2,532 msg/s ([nats-server#8810](https://github.com/nats-io/nats-server/issues/8810)) |
+| `fsync` every 2 minutes | NATS JetStream, defaults | 106,390 msg/s ([nats-server#8810](https://github.com/nats-io/nats-server/issues/8810)) |
+| no `fsync` by default | Kafka, single node | 326,797 rec/s ([test](https://computingforgeeks.com/kafka-vs-redpanda-benchmarks/)) |
+
+The footprint is about a 1 MB binary and a 1,240 KiB idle resident set ([M6](docs/evidence/m6/completion.md)), against Kafka at 1,215 MB and Redpanda at 3,420 MB idle ([test](https://computingforgeeks.com/kafka-vs-redpanda-benchmarks/)).
+
 ## Quickstart
 
 ```sh

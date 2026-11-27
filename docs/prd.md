@@ -124,7 +124,7 @@ No published number matches this contract (an `fsync` before each acknowledgment
 
 - **Throughput.** Systems that `fsync` on every write report hundreds to about 10,000 writes/s. Systems that do not `fsync` on acknowledgment report 30,000 to 300,000+ records/s. The 50,000 records/s target sits between the two groups. It is about 12.8 MB/s, which is small in bytes. Group commit is what makes it reachable.
 - **Latency.** The bound is relative to the device, so no other system's number applies. It is measured at the throughput target's rate, because a closed loop ties latency to throughput ([ADR 0045](decisions/0045-latency-target-is-measured-at-a-paced-rate.md)).
-- **Open time, seal-to-exit, idle resident set, binary size.** No comparable system publishes these. The M1, M6 and M7 benchmarks are the only evidence.
+- **Open time, seal-to-exit, idle resident set, binary size.** SQLite publishes a library footprint of about 650 KB ([footprint](https://sqlite.org/footprint.html)). A third-party benchmark measured Kafka at 1,215 MB idle with a 5.1 s startup, and Redpanda at 3,420 MB idle with a 2.7 s startup ([test](https://computingforgeeks.com/kafka-vs-redpanda-benchmarks/)). This log's measurements are the M1, M6 and M7 benchmarks.
 - Do not read a Kafka or default NATS number as a target. Neither `fsync`s on acknowledgment.
 
 ## M1 implementation readiness
