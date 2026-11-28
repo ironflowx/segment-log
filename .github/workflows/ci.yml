@@ -139,3 +139,21 @@ jobs:
       - run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release -p segment-log-server --target x86_64-unknown-linux-musl
       - run: scripts/m6-footprint.sh target/x86_64-unknown-linux-musl/release/segment-log-server
+
+  # Outside contributions are refused: a PR must come from a branch of this repository, opened by
+  # a maintainer or Dependabot. The step, not the job, is conditional, so the
+  # check cannot skip.
+  maintainer-only:
+    runs-on: ubuntu-26.04
+    steps:
+      - if: github.event_name == 'pull_request'
+        env:
+          HEAD: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          ASSOC: ${{ github.event.pull_request.author_association }}
+        run: |
+          [ "$HEAD" = "$GITHUB_REPOSITORY" ] || { echo "::error::opened from a fork: $HEAD"; exit 1; }
+          case "$AUTHOR:$ASSOC" in
+            *:OWNER | *:MEMBER | *:COLLABORATOR | 'dependabot[bot]':*) ;;
+            *) echo "::error::$AUTHOR ($ASSOC) is not a maintainer"; exit 1 ;;
+          esac
